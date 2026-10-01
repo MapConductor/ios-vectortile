@@ -68,7 +68,8 @@ public final class VectorTileProvider: TileProvider {
 
     private let renderer: VectorTileRenderer
     private let tileSize: Int
-    private let fetchTile: (URL) -> Data?
+    private let fetchTile: (URL, FetchCancellation?) throws -> Data?
+    private let sourceDiskCache: SourceTileDiskCache?
 
     /// Source tiles keyed by URL.
     ///
@@ -95,6 +96,15 @@ public final class VectorTileProvider: TileProvider {
 
     /// Rendered PNGs, so a second launch does not redraw what the first drew.
     private let diskCache: TileDiskCache?
+    /// The ground of every tile the GPU drew, straight RGBA, keyed like the
+    /// disk cache. A glyph generation arriving redraws the tile, and with this
+    /// the redraw is the labels and a PNG encode, not the geometry again.
+    /// Bounded by cost; NSCache is thread-safe and evicts under pressure.
+    private let groundRasters: NSCache<NSString, NSData> = {
+        let cache = NSCache<NSString, NSData>()
+        cache.totalCostLimit = 64 << 20
+        return cache
+    }()
 
     /// Identifies the style these tiles were drawn from. A restyle changes it,
     /// so the old tiles simply stop being found rather than needing to be
@@ -203,10 +213,15 @@ public final class VectorTileProvider: TileProvider {
         /// than a network tile would be — the encoder trades ratio for speed —
         /// so this is generous by design.
         renderedCacheBytes: Int = 48 * 1024 * 1024,
+        /// Budget for fetched source MVT/PBF tiles kept across launches.
+        sourceCacheBytes: Int = 128 * 1024 * 1024,
         /// Pixels drawn per point of screen. Defaults to the display's own
         /// scale, which is what stops a Retina screen stretching every tile.
         renderScale: Int? = nil,
-        fetchTile: ((URL) -> Data?)? = nil
+        /// Replaces the network for source tiles, glyph ranges and the
+        /// sprite. Nil means "no such resource" and is remembered; a thrown
+        /// ``OfflineUnavailableError`` means "not now" and is not.
+        fetchTile: ((URL) throws -> Data?)? = nil
     ) throws {
         // The renderer needs the points a tile covers on screen, not the
         // pixels a render asks for (the label pass draws at twice the
@@ -214,7 +229,15 @@ public final class VectorTileProvider: TileProvider {
         // expressions are read at.
         self.renderer = try VectorTileRenderer(styleJSON: styleJSON, displayTileSize: tileSize)
         self.tileSize = tileSize
-        self.fetchTile = fetchTile ?? { url in VectorTileProvider.get(url, headers: headers) }
+        if let fetchTile {
+            // Public test/custom transports keep their existing synchronous
+            // contract. The built-in URLSession path below is cancellable.
+            self.fetchTile = { url, _ in try fetchTile(url) }
+        } else {
+            self.fetchTile = { url, cancellation in
+                try VectorTileProvider.fetch(url, headers: headers, cancellation: cancellation)
+            }
+        }
         cache.totalCostLimit = cacheBytes
         self.glyphsUnavailable = (try? renderer.glyphsURLTemplate()) == nil
         self.styleKey = Digest.hex(styleJSON)
@@ -232,6 +255,12 @@ public final class VectorTileProvider: TileProvider {
             TileDiskCache(
                 directory: $0.appendingPathComponent("tiles"),
                 budgetBytes: renderedCacheBytes
+            )
+        }
+        self.sourceDiskCache = assetCacheDirectory.flatMap {
+            SourceTileDiskCache(
+                directory: $0.appendingPathComponent("sources"),
+                budgetBytes: sourceCacheBytes
             )
         }
 
@@ -267,6 +296,7 @@ public final class VectorTileProvider: TileProvider {
         guard !closed else { return }
         closed = true
         cache.removeAllObjects()
+        groundRasters.removeAllObjects()
         empties.removeAll()
         renderer.close()
         // Rendered tiles are written off the render thread; without this the
@@ -421,7 +451,21 @@ public final class VectorTileProvider: TileProvider {
                 ? nil
                 : (entry["url"] as? String).flatMap(VectorTileProvider.parse)
         }
-        let tiles = fetchAll(wanted)
+        let priorities = plan.enumerated().map { index, entry in
+            ((entry["labelsOnly"] as? Bool ?? false) ? 1_000 : 0) + index
+        }
+        let fetchStarted = DispatchTime.now()
+        let fetchStats = SourceFetchStats()
+        guard let tiles = fetchAll(wanted, priorities: priorities, stats: fetchStats, isCancelled: isCancelled) else {
+            VectorTileProvider.debug(
+                "tile \(request.z)/\(request.x)/\(request.y) content=\(content) cancelled "
+                    + "mvt(mem=\(fetchStats.memoryHits) disk=\(fetchStats.diskHits) "
+                    + "net=\(fetchStats.networkFetches) shared=\(fetchStats.sharedWaits) "
+                    + "cancel=\(fetchStats.cancelled) queue=\(fetchStats.queueWaitMs)ms)"
+            )
+            return nil
+        }
+        let fetchMs = VectorTileProvider.millis(since: fetchStarted)
         if isClosed || isCancelled() { return nil }
 
         // Cached ranges belong in the store before the tile is judged to be
@@ -436,18 +480,60 @@ public final class VectorTileProvider: TileProvider {
         }
         if isCancelled() { return nil }
 
+        let renderStarted = DispatchTime.now()
         let png: Data?
+        let groundKey = key("ground")
+        // A tile drawn while the network was off and a source was not in the
+        // package is missing ink, like one drawn short of glyphs -- but
+        // nothing will arrive to redraw it, so it must not be kept at all.
+        let drawnShortOfSources = fetchStats.blocked > 0
         switch content {
         case .labels:
             png = renderLabelTile(z: z, x: x, y: y, tiles: tiles)
-        case .ground, .full:
-            png = renderGroundTile(z: z, x: x, y: y, tiles: tiles, content: content)
+        case .full:
+            if let ground = groundRasters.object(forKey: groundKey as NSString) {
+                png = compositeLabels(onto: ground as Data, z: z, x: x, y: y, tiles: tiles)
+            } else {
+                png = renderGroundTile(
+                    z: z, x: x, y: y, tiles: tiles, content: content,
+                    cacheGroundAs: drawnShortOfSources ? nil : groundKey
+                )
+            }
+        case .ground:
+            png = renderGroundTile(z: z, x: x, y: y, tiles: tiles, content: content, cacheGroundAs: nil)
         }
+        let renderMs = VectorTileProvider.millis(since: renderStarted)
 
-        if let png, let store = short ? provisionalKey : completeKey {
+        // Timed separately, and logged: when a tile is slow the answer is
+        // almost always one or the other, and guessing which wastes an
+        // afternoon. android-sdk's provider prints the same line; iOS had no
+        // measurement at all, which is why "it feels slow" had nowhere to go.
+        VectorTileProvider.debug(
+            "tile \(request.z)/\(request.x)/\(request.y) content=\(content) "
+                + "sources=\(wanted.compactMap { $0 }.count) planned=\(plan.count) "
+                + "fetch=\(fetchMs)ms render=\(renderMs)ms bytes=\(png?.count ?? 0) "
+                + "mvt(mem=\(fetchStats.memoryHits) disk=\(fetchStats.diskHits) "
+                + "net=\(fetchStats.networkFetches) shared=\(fetchStats.sharedWaits) "
+                + "cancel=\(fetchStats.cancelled) queue=\(fetchStats.queueWaitMs)ms)"
+        )
+
+        if let png, !drawnShortOfSources, let store = short ? provisionalKey : completeKey {
             diskCache?.put(store, png)
         }
         return png
+    }
+
+    private static func millis(since start: DispatchTime) -> Int {
+        Int((DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds) / 1_000_000)
+    }
+
+    /// On only when the app asks for it, so a release build prints nothing.
+    private static let debugLogging =
+        ProcessInfo.processInfo.environment["MAPCONDUCTOR_DEBUG_LOG"] == "1"
+
+    private static func debug(_ message: @autoclosure () -> String) {
+        guard debugLogging else { return }
+        NSLog("[MapConductor][VectorTile] %@", message())
     }
 
     private func plan(z: UInt8, x: UInt32, y: UInt32) -> [[String: Any]]? {
@@ -461,12 +547,14 @@ public final class VectorTileProvider: TileProvider {
     /// The ground, on the GPU when there is one and the style paints nothing
     /// it cannot draw. `.full` composites labels over the readback.
     private func renderGroundTile(
-        z: UInt8, x: UInt32, y: UInt32, tiles: [Data?], content: Content
+        z: UInt8, x: UInt32, y: UInt32, tiles: [Data?], content: Content, cacheGroundAs: String?
     ) -> Data? {
         // A patterned fill needs an image repeated across a polygon, which the
         // GPU path cannot draw, so those tiles take the slower road.
         let onGpu = gpu != nil && !((try? renderer.needsCPU(z: z, tiles: tiles)) ?? false)
-        if onGpu, let png = renderOnGpu(z: z, x: x, y: y, tiles: tiles, withLabels: content == .full) {
+        if onGpu, let png = renderOnGpu(
+            z: z, x: x, y: y, tiles: tiles, withLabels: content == .full, cacheGroundAs: cacheGroundAs
+        ) {
             gpuRenderCount.increment()
             return png
         }
@@ -523,7 +611,7 @@ public final class VectorTileProvider: TileProvider {
     }()
 
     private func renderOnGpu(
-        z: UInt8, x: UInt32, y: UInt32, tiles: [Data?], withLabels: Bool
+        z: UInt8, x: UInt32, y: UInt32, tiles: [Data?], withLabels: Bool, cacheGroundAs: String?
     ) -> Data? {
         guard let gpu else { return nil }
         do {
@@ -534,6 +622,12 @@ public final class VectorTileProvider: TileProvider {
             // distance field per glyph and are painted over the readback.
             // Without this the GPU path loses every label the style asked for.
             return gpu.renderPng(tessellated) { readback in
+                if let cacheGroundAs, let base = readback.baseAddress {
+                    self.groundRasters.setObject(
+                        NSData(bytes: base, length: readback.count),
+                        forKey: cacheGroundAs as NSString, cost: readback.count
+                    )
+                }
                 guard withLabels else { return }
                 _ = try? self.renderer.drawLabels(
                     z: z, x: x, y: y, tileSize: UInt32(self.tileSize * self.renderScale),
@@ -545,6 +639,25 @@ public final class VectorTileProvider: TileProvider {
         }
     }
 
+    /// Labels over a ground the GPU drew earlier: the whole cost of a glyph
+    /// generation arriving, once the ground is in ``groundRasters``.
+    private func compositeLabels(
+        onto ground: Data, z: UInt8, x: UInt32, y: UInt32, tiles: [Data?]
+    ) -> Data? {
+        let resolution = tileSize * renderScale
+        guard ground.count == resolution * resolution * 4 else { return nil }
+        var rgba = ground
+        guard (try? renderer.drawLabels(
+            z: z, x: x, y: y, tileSize: UInt32(resolution), rgba: &rgba, tiles: tiles
+        )) != nil else { return nil }
+        return rgba.withUnsafeMutableBytes { buffer -> Data? in
+            guard let base = buffer.baseAddress else { return nil }
+            return TilePngEncoder.encode(
+                rgba: base, width: resolution, height: resolution, premultiplied: false
+            )
+        }
+    }
+
     // MARK: - Fetching
 
     /// Fetches a whole plan at once.
@@ -552,60 +665,159 @@ public final class VectorTileProvider: TileProvider {
     /// A plan is nine tiles once the label pass asks for its neighbours, and
     /// nine round trips one after another is a second of waiting for what takes
     /// a fraction of it in parallel.
-    private func fetchAll(_ urls: [URL?]) -> [Data?] {
-        var results = [Data?](repeating: nil, count: urls.count)
+    private func fetchAll(
+        _ urls: [URL?],
+        priorities: [Int],
+        stats: SourceFetchStats,
+        isCancelled: () -> Bool
+    ) -> [Data?]? {
+        let results = FetchResults(count: urls.count)
         let group = DispatchGroup()
-        let resultLock = NSLock()
+        let cancellation = FetchCancellation()
 
-        for (index, url) in urls.enumerated() {
-            guard let url else { continue }
-            fetchSlots.wait()
+        // Sorted on this thread, before anything is dispatched: what is
+        // already here, what somebody else is fetching, and what is ours to
+        // fetch. Only the last kind goes to the queue and takes a slot.
+        //
+        // It used to take a slot for every entry, on this thread, before it
+        // knew which kind it was -- and a tile whose source somebody else was
+        // already fetching then sat in the queue holding a slot just to wait
+        // for them. On a zoom out every source is new and sixteen children
+        // want each one, so the sixteen slots filled with waiters and the
+        // fetches that would have released them could not start. That is the
+        // 1.3 s per request the simulator showed while nothing moved.
+        var waitingOn: [(index: Int, key: String, latch: DispatchSemaphore)] = []
+
+        let ordered = urls.indices.sorted { left, right in
+            (priorities.indices.contains(left) ? priorities[left] : left)
+                < (priorities.indices.contains(right) ? priorities[right] : right)
+        }
+
+        for index in ordered {
+            guard let url = urls[index] else { continue }
+            let key = url.absoluteString
+            if let cached = cache.object(forKey: key as NSString) {
+                stats.memoryHits += 1
+                results.set(cached as Data, at: index)
+                continue
+            }
+            if let cached = sourceDiskCache?.get(key) {
+                stats.diskHits += 1
+                cache.setObject(cached as NSData, forKey: key as NSString, cost: cached.count)
+                results.set(cached, at: index)
+                continue
+            }
+            lock.lock()
+            if empties.contains(key) {
+                lock.unlock()
+                continue
+            }
+            if let latch = inFlight[key] {
+                lock.unlock()
+                stats.sharedWaits += 1
+                waitingOn.append((index, key, latch))
+                continue
+            }
+            let done = DispatchSemaphore(value: 0)
+            inFlight[key] = done
+            lock.unlock()
+
             group.enter()
             fetchQueue.async {
-                defer {
-                    self.fetchSlots.signal()
-                    group.leave()
-                }
-                guard !self.isClosed else { return }
-                let bytes = self.sourceTile(url)
-                resultLock.lock()
-                results[index] = bytes
-                resultLock.unlock()
+                defer { group.leave() }
+                results.set(
+                    self.transfer(url, key: key, done: done, cancellation: cancellation, stats: stats),
+                    at: index
+                )
             }
         }
-        group.wait()
-        return results
+
+        while group.wait(timeout: .now() + .milliseconds(10)) != .success {
+            if isCancelled() {
+                cancellation.cancel()
+                stats.cancelled += 1
+                return nil
+            }
+        }
+
+        // The ones somebody else was fetching ran alongside ours; waiting for
+        // them now costs the slowest of them, not the sum, and holds nothing
+        // but this thread.
+        for (index, key, latch) in waitingOn {
+            while latch.wait(timeout: .now() + .milliseconds(10)) != .success {
+                if isCancelled() { return nil }
+            }
+            latch.signal()
+            if let bytes = cache.object(forKey: key as NSString) {
+                stats.memoryHits += 1
+                results.set(bytes as Data, at: index)
+                continue
+            }
+            if let bytes = sourceDiskCache?.get(key) {
+                stats.diskHits += 1
+                cache.setObject(bytes as NSData, forKey: key as NSString, cost: bytes.count)
+                results.set(bytes, at: index)
+                continue
+            }
+            // They were cancelled before the bytes landed, and a tile left
+            // without its source is drawn blank and cached that way. Fetch it
+            // ourselves rather than inherit their bad luck.
+            lock.lock()
+            let gone = empties.contains(key)
+            let done = inFlight[key] ?? DispatchSemaphore(value: 0)
+            let ours = inFlight[key] == nil
+            if ours { inFlight[key] = done }
+            lock.unlock()
+            if gone { continue }
+            if ours, let url = urls[index] {
+                results.set(
+                    transfer(url, key: key, done: done, cancellation: cancellation, stats: stats),
+                    at: index
+                )
+            }
+        }
+        return results.snapshot()
     }
 
-    private func sourceTile(_ url: URL) -> Data? {
-        let key = url.absoluteString
-        if let cached = cache.object(forKey: key as NSString) { return cached as Data }
-
-        lock.lock()
-        if empties.contains(key) {
-            lock.unlock()
-            return nil
-        }
-        if let waiting = inFlight[key] {
-            // Somebody else is already fetching this. Wait for them rather
-            // than paying for the same bytes twice.
-            lock.unlock()
-            waiting.wait()
-            waiting.signal()
-            return cache.object(forKey: key as NSString) as Data?
-        }
-        let done = DispatchSemaphore(value: 0)
-        inFlight[key] = done
-        lock.unlock()
-
+    /// The transfer itself, and nothing else under a fetch slot.
+    ///
+    /// Caller has already claimed `key` in `inFlight` with `done`; this
+    /// releases both however it ends, so waiters always wake.
+    private func transfer(
+        _ url: URL,
+        key: String,
+        done: DispatchSemaphore,
+        cancellation: FetchCancellation,
+        stats: SourceFetchStats
+    ) -> Data? {
         defer {
             lock.lock()
             inFlight.removeValue(forKey: key)
             lock.unlock()
             done.signal()
         }
+        let queued = DispatchTime.now()
+        while fetchSlots.wait(timeout: .now() + .milliseconds(10)) != .success {
+            if cancellation.isCancelled || isClosed { return nil }
+        }
+        stats.queueWaitMs += VectorTileProvider.millis(since: queued)
+        defer { fetchSlots.signal() }
+        if cancellation.isCancelled || isClosed { return nil }
 
-        guard let bytes = fetchTile(url), !bytes.isEmpty else {
+        stats.networkFetches += 1
+        let fetched: Data?
+        do {
+            fetched = try fetchTile(url, cancellation)
+        } catch {
+            // Not an answer: the network is off, or failed. Either way the
+            // tile is drawn without this source and not kept, so it is
+            // drawn again once the network is back -- and the URL is not
+            // remembered as empty.
+            stats.blocked += 1
+            return nil
+        }
+        guard let bytes = fetched, !bytes.isEmpty else {
+            if cancellation.isCancelled { return nil }
             // Only a genuine "no tile" answer is remembered. A transient
             // failure blacklisted here would leave a hole for the session.
             lock.lock()
@@ -614,6 +826,7 @@ public final class VectorTileProvider: TileProvider {
             return nil
         }
         cache.setObject(bytes as NSData, forKey: key as NSString, cost: bytes.count)
+        sourceDiskCache?.put(key, bytes)
         return bytes
     }
 
@@ -653,11 +866,21 @@ public final class VectorTileProvider: TileProvider {
     }
 
     private func fetched(_ url: String, into store: StyleAssetCache?) -> Data? {
-        guard let target = VectorTileProvider.parse(url),
-              let bytes = fetchTile(target), !bytes.isEmpty
-        else { return nil }
-        store?.put(url, bytes)
-        return bytes
+        guard let target = VectorTileProvider.parse(url) else { return nil }
+        do {
+            guard let bytes = try fetchTile(target, nil), !bytes.isEmpty else { return nil }
+            store?.put(url, bytes)
+            return bytes
+        } catch is OfflineUnavailableError {
+            // Unclaimed: the range is there to be had once the network is
+            // back. Harmless for the sprite, which is not claimed.
+            lock.lock()
+            requestedGlyphs.remove(url)
+            lock.unlock()
+            return nil
+        } catch {
+            return nil
+        }
     }
 
     /**
@@ -770,21 +993,108 @@ public final class VectorTileProvider: TileProvider {
 
     /// Synchronous by design: `renderTile` is already called off the main
     /// thread by the tile server, and the plan/render contract is positional.
-    private static func get(_ url: URL, headers: [String: String]) -> Data? {
+    /// Like ``get(_:headers:cancellation:)``, but a transport failure -- no
+    /// network, a refused connection, a 5xx -- is thrown rather than turned
+    /// into "no such tile", which the caller would remember for the session.
+    static func fetch(
+        _ url: URL,
+        headers: [String: String],
+        cancellation: FetchCancellation?
+    ) throws -> Data? {
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+        let done = DispatchSemaphore(value: 0)
+        var payload: Data?
+        var failure: Error?
+        var status = 0
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+            defer { done.signal() }
+            failure = error
+            guard let http = response as? HTTPURLResponse else { return }
+            status = http.statusCode
+            if (200..<300).contains(http.statusCode) { payload = data }
+        }
+        task.resume()
+        while done.wait(timeout: .now() + .milliseconds(10)) != .success {
+            if cancellation?.isCancelled == true {
+                task.cancel()
+                done.wait()
+                return nil
+            }
+        }
+        if let failure { throw failure }
+        // A missing tile is normal at the edge of a source's coverage; a
+        // server that is down is not.
+        if status >= 500 { throw URLError(.badServerResponse) }
+        return payload
+    }
+
+    static func get(
+        _ url: URL,
+        headers: [String: String],
+        cancellation: FetchCancellation?
+    ) -> Data? {
         var request = URLRequest(url: url, timeoutInterval: 15)
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
 
         var payload: Data?
         let done = DispatchSemaphore(value: 0)
-        URLSession.shared.dataTask(with: request) { data, response, _ in
+        let task = URLSession.shared.dataTask(with: request) { data, response, _ in
             defer { done.signal() }
             guard let http = response as? HTTPURLResponse else { return }
             // A missing tile is normal at the edge of a source's coverage.
             guard (200..<300).contains(http.statusCode) else { return }
             payload = data
-        }.resume()
-        done.wait()
+        }
+        task.resume()
+        while done.wait(timeout: .now() + .milliseconds(10)) != .success {
+            if cancellation?.isCancelled == true {
+                task.cancel()
+                // The completion handler signals `done`; waiting for it keeps
+                // the captured payload alive until URLSession is finished.
+                done.wait()
+                return nil
+            }
+        }
         return payload
+    }
+}
+
+final class FetchCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+}
+
+private final class FetchResults: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Data?]
+
+    init(count: Int) {
+        values = [Data?](repeating: nil, count: count)
+    }
+
+    func set(_ value: Data?, at index: Int) {
+        lock.lock()
+        values[index] = value
+        lock.unlock()
+    }
+
+    func snapshot() -> [Data?] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
     }
 }
 
