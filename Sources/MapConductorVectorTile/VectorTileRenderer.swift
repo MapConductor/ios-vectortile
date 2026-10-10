@@ -44,7 +44,6 @@ private func withTiles<R>(
     }
 }
 
-/// Decodes one of the JSON arrays the native side answers with, and frees it.
 private func takeStrings(_ json: UnsafeMutablePointer<CChar>?) -> [String] {
     guard let json else { return [] }
     defer { mvt_string_free(json) }
@@ -86,8 +85,13 @@ public final class VectorTileRenderer {
 
      Kept in step with the Android binding's `OUTPUT_VERSION`: they cache the
      output of the same native renderer.
+
+     18: glyph pixels align across tile boundaries.
+     19: label bounds include glyph bearings and SDF raster extents.
+     20: that extent decides which tile a label draws in; collisions are
+         judged on the layout box again, so labels are as dense as before.
      */
-    public static let outputVersion = 17
+    public static let outputVersion = 23
 
     private var handle: OpaquePointer?
 
@@ -363,7 +367,7 @@ public final class VectorTileRenderer {
     }
 
     /// Whether this tile must be drawn on the CPU because the style paints
-    /// something the GPU path cannot — today, a patterned fill.
+    /// a pattern the GPU cannot draw or a polygon that is too costly to triangulate.
     public func needsCPU(z: UInt8, tiles: [Data?]) throws -> Bool {
         return try withRenderer { live in
             return withTiles(tiles) { data, dataLength, lengths, lengthsCount in
