@@ -1,5 +1,6 @@
 import Foundation
 import MapConductorCore
+import MapConductorVectorStyle
 import UIKit
 
 /**
@@ -69,6 +70,15 @@ public final class VectorTileProvider: TileProvider {
     private let renderer: VectorTileRenderer
     private let tileSize: Int
     private let fetchTile: (URL, FetchCancellation?) throws -> Data?
+    /// The network for source tiles, with what the server said about caching
+    /// them. Glyphs and the sprite keep using `fetchTile`.
+    private let sourceFetch: (URL, FetchCancellation?) throws -> SourceResponse
+    /// Bytes already on the device -- an offline package -- read at once.
+    private let localTile: ((URL) -> Data?)?
+    /// Asks the server whether a cached tile changed. Nil when the caller
+    /// replaced the network and said nothing about checking: its transport
+    /// is the only one allowed to go out.
+    private let revalidator: ((URL, SourceValidators) throws -> SourceResponse)?
     private let sourceDiskCache: SourceTileDiskCache?
 
     /// Source tiles keyed by URL.
@@ -76,16 +86,17 @@ public final class VectorTileProvider: TileProvider {
     /// Not an optimisation detail: neighbouring target tiles routinely need the
     /// same source tile — always, once overzoom kicks in, where one magnified
     /// ancestor serves 16 targets — and a map asks for a whole viewport at once.
-    /// Budgeted in bytes via `totalCostLimit`, not in entries. Counting
+    /// Budgeted by a strict byte limit and idle TTL. Counting
     /// entries is the easy mistake: a basemap tile is 150-300 KB, so a few
     /// hundred of them is tens of megabytes.
-    private var cache = NSCache<NSString, NSData>()
+    private var cache = TileMemoryCache<Data>(byteLimit: 16 << 20)
     /// Present only when GPU rendering is in use.
     private let gpu: MetalTileRasterizer?
     private let gpuRenderCount = Counter()
     private let gpuFallbackCount = Counter()
     /// URLs known to hold nothing, so a missing tile is not re-requested.
-    private var empties = Set<String>()
+    private let empties = TileMemoryCache<Bool>(byteLimit: 256 << 10, countLimit: 1024, ttl: 30)
+    private var memoryWarningObserver: NSObjectProtocol?
     private let lock = NSLock()
     private var closed = false
 
@@ -99,12 +110,8 @@ public final class VectorTileProvider: TileProvider {
     /// The ground of every tile the GPU drew, straight RGBA, keyed like the
     /// disk cache. A glyph generation arriving redraws the tile, and with this
     /// the redraw is the labels and a PNG encode, not the geometry again.
-    /// Bounded by cost; NSCache is thread-safe and evicts under pressure.
-    private let groundRasters: NSCache<NSString, NSData> = {
-        let cache = NSCache<NSString, NSData>()
-        cache.totalCostLimit = 64 << 20
-        return cache
-    }()
+    /// Strict LRU budget for raw RGBA; compressed source bytes have their own budget.
+    private let groundRasters = TileMemoryCache<Data>(byteLimit: 32 << 20, countLimit: 64)
 
     /// Identifies the style these tiles were drawn from. A restyle changes it,
     /// so the old tiles simply stop being found rather than needing to be
@@ -164,6 +171,61 @@ public final class VectorTileProvider: TileProvider {
     /// drawn without those labels, and nothing else will replace them.
     public var onGlyphsLoaded: (() -> Void)?
 
+    /**
+     Told when source tiles arrive that tiles already on screen were drawn
+     without, or when a cached tile turned out to have changed upstream.
+
+     A tile whose sources are slow is drawn after ``sourceGrace`` with what
+     has arrived, rather than leaving the map blank for a network round trip
+     (or a fifteen-second timeout on a Wi-Fi that answers nothing). Like
+     ``onGlyphsLoaded``, the host must make the map refetch -- *both* halves,
+     since the ground is missing geometry too.
+     */
+    public var onSourcesLoaded: (() -> Void)?
+
+    /**
+     How long a tile waits for sources that are not on the device before it
+     is drawn without them.
+
+     Long enough that a healthy connection still delivers whole tiles; short
+     enough that a stalled one cannot hold the tile server's render lane. A
+     tile drawn short is not kept, and redrawn once its sources land.
+     */
+    public static let sourceGrace: TimeInterval = 0.4
+
+    /// ``sourceGrace``, adjustable by the tests that are about something else.
+    var sourceGrace: TimeInterval = VectorTileProvider.sourceGrace
+
+    /// Source URLs a tile was drawn without, so their arrival is worth a handover.
+    private var drawnWithout = Set<String>()
+    private var sourcesNotifyPending = false
+
+    /**
+     Set once a revalidation replaced bytes this provider may already have
+     drawn from.
+
+     The native renderer keeps decoded source tiles keyed by source and
+     coordinates, not by bytes, and offers no way to forget one -- so until
+     its bounded cache lets the old tile go, a redraw here can still show the
+     old geometry. Nothing drawn from then on is kept on disk: the next
+     provider, which decodes the new bytes, must not be served this one's
+     pictures under the new revision.
+     */
+    private var replacedSources = false
+
+    /// Revalidations under way, so a tile drawn by nine neighbours is checked once.
+    private var revalidating = Set<String>()
+
+    /// Background checks of stale cached tiles. Two at a time: they are never
+    /// what the map is waiting for, and must not crowd out what it is.
+    private let revalidationQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "mapconductor.vectortile.revalidate"
+        queue.qualityOfService = .utility
+        queue.maxConcurrentOperationCount = 2
+        return queue
+    }()
+
     /// How long to let a burst of ranges settle before telling the host.
     ///
     /// A viewport's worth arrives within a second or two of each other, and
@@ -207,6 +269,13 @@ public final class VectorTileProvider: TileProvider {
     ///   or `renderFailed` if `renderMode` is `.gpu` and Metal is unavailable.
     public init(
         styleJSON: String,
+        /// Adjustments applied to the style before anything is drawn -- the
+        /// same rules ``VectorStyle`` takes, so "roads are white" or "no
+        /// buildings" reads the same wherever it is written. A rule that
+        /// hides a role is the reason to reach for this rather than editing
+        /// the document: those layers are switched off in what the renderer
+        /// is given, so they cost nothing to not draw.
+        rules: StyleRules = .none,
         tileSize: Int = VectorTileProvider.defaultTileSize,
         headers: [String: String] = [:],
         cacheBytes: Int = 16 * 1024 * 1024,
@@ -227,26 +296,55 @@ public final class VectorTileProvider: TileProvider {
         /// Replaces the network for source tiles, glyph ranges and the
         /// sprite. Nil means "no such resource" and is remembered; a thrown
         /// ``OfflineUnavailableError`` means "not now" and is not.
-        fetchTile: ((URL) throws -> Data?)? = nil
+        fetchTile: ((URL) throws -> Data?)? = nil,
+        /// Answers from local storage at once -- an offline package -- and is
+        /// consulted before any network slot, so a tile on the device is never
+        /// queued behind fetches waiting on a slow network. Nil means "not here".
+        localTile: ((URL) -> Data?)? = nil,
+        /// Asks the server whether a cached source tile changed, with the
+        /// validators it was stored with. Defaults to plain HTTP with
+        /// `headers` when `fetchTile` is nil; with a custom `fetchTile` and no
+        /// `revalidate`, cached tiles are never checked. Throwing (offline,
+        /// say) leaves the cached tile as it is.
+        revalidate: ((URL, SourceValidators) throws -> SourceResponse)? = nil
     ) throws {
         // The renderer needs the points a tile covers on screen, not the
         // pixels a render asks for (the label pass draws at twice the
         // pixels). It sets the size the style draws at and the zoom its
         // expressions are read at.
-        self.renderer = try VectorTileRenderer(styleJSON: styleJSON, displayTileSize: tileSize)
+        let drawn = try drawnStyleJSON(styleJSON, rules)
+        self.renderer = try VectorTileRenderer(styleJSON: drawn, displayTileSize: tileSize)
         self.tileSize = tileSize
         if let fetchTile {
             // Public test/custom transports keep their existing synchronous
             // contract. The built-in URLSession path below is cancellable.
             self.fetchTile = { url, _ in try fetchTile(url) }
+            self.sourceFetch = { url, _ in
+                let bytes = try fetchTile(url)
+                return SourceResponse(status: bytes == nil ? 404 : 200, body: bytes)
+            }
+            self.revalidator = revalidate
         } else {
             self.fetchTile = { url, cancellation in
                 try VectorTileProvider.fetch(url, headers: headers, cancellation: cancellation)
             }
+            // The built-in path keeps the response headers, so the tile can
+            // be checked later instead of fetched again.
+            self.sourceFetch = { url, cancellation in
+                try VectorTileProvider.conditionalFetch(url, validators: .none, headers: headers, cancellation: cancellation)
+            }
+            self.revalidator = revalidate ?? { url, validators in
+                try VectorTileProvider.conditionalFetch(url, validators: validators, headers: headers)
+            }
         }
-        cache.totalCostLimit = cacheBytes
+        self.localTile = localTile
+        cache = TileMemoryCache<Data>(byteLimit: cacheBytes)
         self.glyphsUnavailable = (try? renderer.glyphsURLTemplate()) == nil
-        self.styleKey = Digest.hex(styleJSON)
+        // The *drawn* document, not the author's: rendered tiles are keyed by
+        // it, and a style with its buildings hidden must not be served the
+        // tiles drawn with them -- nor leave its own behind for the style
+        // that comes back.
+        self.styleKey = Digest.hex(drawn)
         self.renderScale = max(1, renderScale ?? Int(UIScreen.main.scale.rounded()))
 
         // Separate directories: a glyph range and a sprite sheet have nothing
@@ -288,10 +386,18 @@ public final class VectorTileProvider: TileProvider {
             self.gpu = rasterizer
         }
 
+        memoryWarningObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            self?.cache.removeAll()
+            self?.groundRasters.removeAll()
+            self?.empties.removeAll()
+        }
         warmStyleAssets()
     }
 
     deinit {
+        if let memoryWarningObserver { NotificationCenter.default.removeObserver(memoryWarningObserver) }
         close()
     }
 
@@ -301,15 +407,17 @@ public final class VectorTileProvider: TileProvider {
         guard !closed else { return false }
         closed = true
         onGlyphsLoaded = nil
+        onSourcesLoaded = nil
+        revalidationQueue.cancelAllOperations()
         empties.removeAll()
         return true
     }
 
     private func releaseResources() {
         renderer.close()
-        // A successor may share these source bytes. NSCache releases them
+        // A successor may share these source bytes. The bounded cache releases them
         // when the last provider goes away; closing one must not evict them.
-        groundRasters.removeAllObjects()
+        groundRasters.removeAll()
         diskCache?.flush()
     }
 
@@ -364,11 +472,12 @@ public final class VectorTileProvider: TileProvider {
     ///
     /// The caller still has to make the map drop its *raster* tiles; pass a new
     /// `cacheKey` to `LocalTileServer.urlTemplate`.
-    public func setStyle(_ styleJSON: String) throws {
-        try renderer.setStyle(styleJSON)
+    public func setStyle(_ styleJSON: String, rules: StyleRules = .none) throws {
+        let drawn = try drawnStyleJSON(styleJSON, rules)
+        try renderer.setStyle(drawn)
         // Rendered tiles are keyed by style, so the old ones simply stop being
         // found. Nothing has to be deleted.
-        styleKey = Digest.hex(styleJSON)
+        styleKey = Digest.hex(drawn)
         warmStyleAssets()
     }
 
@@ -424,8 +533,22 @@ public final class VectorTileProvider: TileProvider {
         content: Content = .full,
         isCancelled: () -> Bool = { false }
     ) -> Data? {
+        // Dispatch workers otherwise retain temporary Foundation/Metal objects
+        // until their outer pool drains, potentially across many panned tiles.
+        autoreleasepool {
+            renderTileInPool(request: request, content: content, isCancelled: isCancelled)
+        }
+    }
+
+    private func renderTileInPool(
+        request: TileRequest, content: Content, isCancelled: () -> Bool
+    ) -> Data? {
         if isClosed || isCancelled() { return nil }
 
+        let sourceZoomOffset = request.sourceZoomOffset
+        // Changes only when a revalidation found new bytes upstream; tiles
+        // drawn from the old ones then stop being found.
+        let sourceRevision = sourceDiskCache?.revision ?? 0
         let z = UInt8(clamping: request.z)
         let x = UInt32(clamping: request.x)
         let y = UInt32(clamping: request.y)
@@ -447,6 +570,8 @@ public final class VectorTileProvider: TileProvider {
                 "v\(VectorTileRenderer.outputVersion)",
                 generation,
                 "scale\(renderScale)",
+                "sourceOffset\(sourceZoomOffset)",
+                "sources\(sourceRevision)",
                 "\(request.z)/\(request.x)/\(request.y)"
             )
         }
@@ -469,7 +594,7 @@ public final class VectorTileProvider: TileProvider {
             if let hit = diskCache?.get(candidate) { return hit }
         }
 
-        guard let plan = plan(z: z, x: x, y: y) else { return nil }
+        guard let plan = plan(z: z, x: x, y: y, sourceZoomOffset: sourceZoomOffset) else { return nil }
 
         // The ground never draws a label, so the ring of neighbours the label
         // pass asks for is nine fetches it has no use for. The entries stay in
@@ -502,7 +627,7 @@ public final class VectorTileProvider: TileProvider {
         // missing them; otherwise the first tile of a launch is drawn bare and
         // handed over a moment later for no reason. The ground has no glyphs,
         // so it never waits.
-        let short = content != .ground && requestGlyphs(z: z, x: x, y: y, tiles: tiles)
+        let short = content != .ground && requestGlyphs(z: z, x: x, y: y, tiles: tiles, sourceZoomOffset: sourceZoomOffset)
         if short {
             lock.lock()
             provisionalSinceHandover = true
@@ -516,21 +641,27 @@ public final class VectorTileProvider: TileProvider {
         // A tile drawn while the network was off and a source was not in the
         // package is missing ink, like one drawn short of glyphs -- but
         // nothing will arrive to redraw it, so it must not be kept at all.
-        let drawnShortOfSources = fetchStats.blocked > 0
+        // So is one drawn before slow sources arrived; those are on their way
+        // and `onSourcesLoaded` brings the finished tile.
+        let drawnShortOfSources = fetchStats.blocked > 0 || fetchStats.pending > 0
+        lock.lock()
+        let keep = !drawnShortOfSources && !replacedSources
+        lock.unlock()
         switch content {
         case .labels:
-            png = renderLabelTile(z: z, x: x, y: y, tiles: tiles)
+            png = renderLabelTile(z: z, x: x, y: y, tiles: tiles, sourceZoomOffset: sourceZoomOffset)
         case .full:
-            if let ground = groundRasters.object(forKey: groundKey as NSString) {
-                png = compositeLabels(onto: ground as Data, z: z, x: x, y: y, tiles: tiles)
+            if let ground = groundRasters.value(for: groundKey) {
+                png = compositeLabels(onto: ground as Data, z: z, x: x, y: y, tiles: tiles, sourceZoomOffset: sourceZoomOffset)
             } else {
                 png = renderGroundTile(
                     z: z, x: x, y: y, tiles: tiles, content: content,
-                    cacheGroundAs: drawnShortOfSources ? nil : groundKey, isCancelled: isCancelled
+                    cacheGroundAs: keep ? groundKey : nil, isCancelled: isCancelled,
+                    sourceZoomOffset: sourceZoomOffset
                 )
             }
         case .ground:
-            png = renderGroundTile(z: z, x: x, y: y, tiles: tiles, content: content, cacheGroundAs: nil, isCancelled: isCancelled)
+            png = renderGroundTile(z: z, x: x, y: y, tiles: tiles, content: content, cacheGroundAs: nil, isCancelled: isCancelled, sourceZoomOffset: sourceZoomOffset)
         }
         let renderMs = VectorTileProvider.millis(since: renderStarted)
 
@@ -544,11 +675,11 @@ public final class VectorTileProvider: TileProvider {
                 + "fetch=\(fetchMs)ms render=\(renderMs)ms bytes=\(png?.count ?? 0) "
                 + "mvt(mem=\(fetchStats.memoryHits) disk=\(fetchStats.diskHits) "
                 + "net=\(fetchStats.networkFetches) shared=\(fetchStats.sharedWaits) "
-                + "blocked=\(fetchStats.blocked) cancel=\(fetchStats.cancelled) "
-                + "queue=\(fetchStats.queueWaitMs)ms)"
+                + "blocked=\(fetchStats.blocked) pending=\(fetchStats.pending) "
+                + "cancel=\(fetchStats.cancelled) queue=\(fetchStats.queueWaitMs)ms)"
         )
 
-        if let png, !drawnShortOfSources, let store = short ? provisionalKey : completeKey {
+        if let png, keep, let store = short ? provisionalKey : completeKey {
             diskCache?.put(store, png)
         }
         return png
@@ -567,8 +698,8 @@ public final class VectorTileProvider: TileProvider {
         NSLog("[MapConductor][VectorTile] %@", message())
     }
 
-    private func plan(z: UInt8, x: UInt32, y: UInt32) -> [[String: Any]]? {
-        guard let json = try? renderer.plan(z: z, x: x, y: y),
+    private func plan(z: UInt8, x: UInt32, y: UInt32, sourceZoomOffset: Int) -> [[String: Any]]? {
+        guard let json = try? renderer.plan(z: z, x: x, y: y, sourceZoomOffset: sourceZoomOffset),
               let data = json.data(using: .utf8),
               let plan = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
         else { return nil }
@@ -579,14 +710,16 @@ public final class VectorTileProvider: TileProvider {
     /// it cannot draw. `.full` composites labels over the readback.
     private func renderGroundTile(
         z: UInt8, x: UInt32, y: UInt32, tiles: [Data?], content: Content, cacheGroundAs: String?,
-        isCancelled: () -> Bool
+        isCancelled: () -> Bool,
+        sourceZoomOffset: Int
     ) -> Data? {
         // Patterns need the CPU; very complex polygons also use its scanline
         // renderer to avoid expensive GPU triangulation.
-        let onGpu = gpu != nil && !((try? renderer.needsCPU(z: z, tiles: tiles)) ?? false)
+        let onGpu = gpu != nil && !((try? renderer.needsCPU(z: z, tiles: tiles, sourceZoomOffset: sourceZoomOffset)) ?? false)
         if onGpu, let png = renderOnGpu(
             z: z, x: x, y: y, tiles: tiles, withLabels: content == .full, cacheGroundAs: cacheGroundAs,
-            isCancelled: isCancelled
+            isCancelled: isCancelled,
+            sourceZoomOffset: sourceZoomOffset
         ) {
             gpuRenderCount.increment()
             return png
@@ -599,10 +732,11 @@ public final class VectorTileProvider: TileProvider {
         let resolution = UInt32(tileSize * renderScale)
         if content == .ground {
             return try? renderer.renderGeometry(
-                z: z, x: x, y: y, tileSize: resolution, tiles: tiles
+                z: z, x: x, y: y, tileSize: resolution, tiles: tiles,
+                sourceZoomOffset: sourceZoomOffset
             )
         }
-        return try? renderer.render(z: z, x: x, y: y, tileSize: resolution, tiles: tiles)
+        return try? renderer.render(z: z, x: x, y: y, tileSize: resolution, tiles: tiles, sourceZoomOffset: sourceZoomOffset)
     }
 
     /**
@@ -611,14 +745,15 @@ public final class VectorTileProvider: TileProvider {
      Pure CPU: no GPU pass, no readback — which is the point of serving them as
      their own layer. Several of these run while the GPU draws the ground.
      */
-    private func renderLabelTile(z: UInt8, x: UInt32, y: UInt32, tiles: [Data?]) -> Data? {
+    private func renderLabelTile(z: UInt8, x: UInt32, y: UInt32, tiles: [Data?], sourceZoomOffset: Int) -> Data? {
         // The larger of the two, not the product: `labelResolution` exists to
         // reach device resolution on a 1x screen, and `renderScale` already
         // does that on a Retina one. Multiplying them would draw sixteen times
         // the pixels for no visible gain.
         let resolution = tileSize * max(renderScale, VectorTileProvider.labelResolution)
         guard let drawn = try? renderer.renderLabels(
-            z: z, x: x, y: y, tileSize: UInt32(resolution), tiles: tiles
+            z: z, x: x, y: y, tileSize: UInt32(resolution), tiles: tiles,
+            sourceZoomOffset: sourceZoomOffset
         ) else { return nil }
 
         // A tile with nothing on it is common — water, fields — and one shared
@@ -647,13 +782,15 @@ public final class VectorTileProvider: TileProvider {
 
     private func renderOnGpu(
         z: UInt8, x: UInt32, y: UInt32, tiles: [Data?], withLabels: Bool, cacheGroundAs: String?,
-        isCancelled: () -> Bool
+        isCancelled: () -> Bool,
+        sourceZoomOffset: Int
     ) -> Data? {
         guard !isClosed, !isCancelled(), let gpu else { return nil }
         do {
             let started = DispatchTime.now()
             let tessellated = try renderer.tessellate(
-                z: z, x: x, y: y, tileSize: UInt32(tileSize * renderScale), tiles: tiles
+                z: z, x: x, y: y, tileSize: UInt32(tileSize * renderScale), tiles: tiles,
+                sourceZoomOffset: sourceZoomOffset
             )
             let tessellateMs = Self.millis(since: started)
             guard !isClosed, !isCancelled() else { return nil }
@@ -663,15 +800,16 @@ public final class VectorTileProvider: TileProvider {
             // Without this the GPU path loses every label the style asked for.
             let png = gpu.renderPng(tessellated, isCancelled: isCancelled) { readback in
                 if let cacheGroundAs, let base = readback.baseAddress {
-                    self.groundRasters.setObject(
-                        NSData(bytes: base, length: readback.count),
-                        forKey: cacheGroundAs as NSString, cost: readback.count
+                    self.groundRasters.insert(
+                        Data(bytes: base, count: readback.count),
+                        for: cacheGroundAs, cost: readback.count + cacheGroundAs.utf8.count + 128
                     )
                 }
                 guard withLabels else { return }
                 _ = try? self.renderer.drawLabels(
                     z: z, x: x, y: y, tileSize: UInt32(self.tileSize * self.renderScale),
-                    rgba: readback, tiles: tiles
+                    rgba: readback, tiles: tiles,
+                    sourceZoomOffset: sourceZoomOffset
                 )
             }
             Self.debug("gpu tile \(z)/\(x)/\(y) tessellate=\(tessellateMs)ms draw=\(Self.millis(since: drawStarted))ms")
@@ -684,13 +822,15 @@ public final class VectorTileProvider: TileProvider {
     /// Labels over a ground the GPU drew earlier: the whole cost of a glyph
     /// generation arriving, once the ground is in ``groundRasters``.
     private func compositeLabels(
-        onto ground: Data, z: UInt8, x: UInt32, y: UInt32, tiles: [Data?]
+        onto ground: Data, z: UInt8, x: UInt32, y: UInt32, tiles: [Data?],
+        sourceZoomOffset: Int
     ) -> Data? {
         let resolution = tileSize * renderScale
         guard ground.count == resolution * resolution * 4 else { return nil }
         var rgba = ground
         guard (try? renderer.drawLabels(
-            z: z, x: x, y: y, tileSize: UInt32(resolution), rgba: &rgba, tiles: tiles
+            z: z, x: x, y: y, tileSize: UInt32(resolution), rgba: &rgba, tiles: tiles,
+            sourceZoomOffset: sourceZoomOffset
         )) != nil else { return nil }
         return rgba.withUnsafeMutableBytes { buffer -> Data? in
             guard let base = buffer.baseAddress else { return nil }
@@ -716,7 +856,10 @@ public final class VectorTileProvider: TileProvider {
         let results = FetchResults(count: urls.count)
         let group = DispatchGroup()
         let cancellation = FetchCancellation()
-        defer { cancellation.cancel() }
+        // Left running when the tile is drawn without them: the bytes are
+        // still wanted, by the redraw `onSourcesLoaded` asks for.
+        var detached = false
+        defer { if !detached { cancellation.cancel() } }
 
         // Sorted on this thread, before anything is dispatched: what is
         // already here, what somebody else is fetching, and what is ours to
@@ -739,14 +882,19 @@ public final class VectorTileProvider: TileProvider {
         for index in ordered {
             guard let url = urls[index] else { continue }
             let key = url.absoluteString
-            if let cached = cache.object(forKey: key as NSString) {
-                stats.memoryHits += 1
-                results.set(cached as Data, at: index)
+            // What is on the device is read here, before anything can queue
+            // behind the network. An offline package used to be read inside
+            // the fetch slot, so on a Wi-Fi that answered nothing the tiles it
+            // held waited out other tiles' fifteen-second timeouts and the
+            // downloaded area stayed white.
+            if let local = localBytes(url, key: key, stats: stats) {
+                results.set(local, at: index)
                 continue
             }
             lock.lock()
-            if empties.contains(key) {
+            if empties.value(for: key) == true {
                 lock.unlock()
+                results.set(nil, at: index)
                 continue
             }
             if let latch = inFlight[key] {
@@ -769,45 +917,60 @@ public final class VectorTileProvider: TileProvider {
             }
         }
 
+        // Everything below waits on the network, and no longer than this.
+        let deadline = DispatchTime.now() + sourceGrace
+        func expired() -> Bool { DispatchTime.now() >= deadline }
+
         while group.wait(timeout: .now() + .milliseconds(10)) != .success {
             if isClosed || isCancelled() {
                 cancellation.cancel()
                 stats.cancelled += 1
                 return nil
             }
+            if expired() { break }
         }
 
         // The ones somebody else was fetching ran alongside ours; waiting for
         // them now costs the slowest of them, not the sum, and holds nothing
         // but this thread.
-        for (index, key, originalLatch) in waitingOn {
+        waiting: for (index, key, originalLatch) in waitingOn {
             var latch = originalLatch
             while true {
                 while latch.wait(timeout: .now() + .milliseconds(10)) != .success {
                     if isClosed || isCancelled() { return nil }
+                    if expired() { continue waiting }
                 }
                 latch.signal()
-                if let bytes = cache.object(forKey: key as NSString) {
+                // An oversized or evicted tile still belongs to all requests
+                // already sharing this flight. Keep it only until they finish.
+                let response = latch.response
+                if response.received {
+                    results.set(response.bytes, at: index)
+                    break
+                }
+                if let bytes = cache.value(for: key) {
                     stats.memoryHits += 1
                     results.set(bytes as Data, at: index)
                     break
                 }
                 if let bytes = sourceDiskCache?.get(key) {
                     stats.diskHits += 1
-                    cache.setObject(bytes as NSData, forKey: key as NSString, cost: bytes.count)
+                    cache.insert(bytes, for: key, cost: bytes.count + key.utf8.count + 128)
                     results.set(bytes, at: index)
                     break
                 }
                 if latch.isUnavailable {
                     stats.blocked += 1
+                    results.set(nil, at: index)
                     break
                 }
                 // They were cancelled before the bytes landed, and a tile left
                 // without its source is drawn blank and cached that way. Fetch it
                 // ourselves rather than inherit their bad luck.
                 lock.lock()
-                if empties.contains(key) {
+                if empties.value(for: key) == true {
                     lock.unlock()
+                    results.set(nil, at: index)
                     break
                 }
                 let done = inFlight[key] ?? SourceFetchFlight()
@@ -828,6 +991,7 @@ public final class VectorTileProvider: TileProvider {
                     }
                     while retry.wait(timeout: .now() + .milliseconds(10)) != .success {
                         if isClosed || isCancelled() { return nil }
+                        if expired() { continue waiting }
                     }
                     break
                 }
@@ -836,7 +1000,49 @@ public final class VectorTileProvider: TileProvider {
                 latch = done
             }
         }
-        return results.snapshot()
+
+        // Whatever has not answered by now is drawn without. The tile is not
+        // kept, and its sources -- still coming -- bring the redraw.
+        let snapshot = results.snapshot()
+        let pending = urls.indices.compactMap { index -> String? in
+            guard let url = urls[index], !snapshot.settled[index] else { return nil }
+            return url.absoluteString
+        }
+        if !pending.isEmpty {
+            detached = true
+            stats.pending += pending.count
+            lock.lock()
+            drawnWithout.formUnion(pending)
+            lock.unlock()
+            // A source that landed between the deadline and the line above
+            // found nobody waiting for it; it is owed the handover all the same.
+            for key in pending where cache.value(for: key) != nil { sourceLanded(key) }
+        }
+        return snapshot.values
+    }
+
+    /**
+     A source tile already on the device: in memory, in the offline package,
+     or in the disk cache. Never waits for the network; a stale disk entry is
+     served as it is and checked in the background.
+     */
+    private func localBytes(_ url: URL, key: String, stats: SourceFetchStats) -> Data? {
+        if let cached = cache.value(for: key) {
+            stats.memoryHits += 1
+            return cached as Data
+        }
+        if let local = localTile?(url), !local.isEmpty {
+            stats.localHits += 1
+            cache.insert(local, for: key, cost: local.count + key.utf8.count + 128)
+            return local
+        }
+        if let entry = sourceDiskCache?.entry(key) {
+            stats.diskHits += 1
+            cache.insert(entry.bytes, for: key, cost: entry.bytes.count + key.utf8.count + 128)
+            if entry.meta?.isStale() ?? true { revalidate(url, key: key, cached: entry.bytes, meta: entry.meta) }
+            return entry.bytes
+        }
+        return nil
     }
 
     /// The transfer itself, and nothing else under a fetch slot.
@@ -864,41 +1070,133 @@ public final class VectorTileProvider: TileProvider {
         defer { fetchSlots.signal() }
         if cancellation.isCancelled || isClosed { return nil }
 
-        // Claim the URL before disk I/O so neighbouring tiles share cold reads.
-        if let cached = cache.object(forKey: key as NSString) {
+        // Somebody may have finished it while this one queued for a slot.
+        if let cached = cache.value(for: key) {
             stats.memoryHits += 1
+            done.publish(cached)
             return cached as Data
         }
-        if let cached = sourceDiskCache?.get(key) {
-            stats.diskHits += 1
-            cache.setObject(cached as NSData, forKey: key as NSString, cost: cached.count)
-            return cached
-        }
         stats.networkFetches += 1
-        let fetched: Data?
+        let response: SourceResponse
         do {
-            fetched = try fetchTile(url, cancellation)
+            response = try sourceFetch(url, cancellation)
         } catch {
+            if cancellation.isCancelled { return nil }
             // Not an answer: the network is off, or failed. Either way the
             // tile is drawn without this source and not kept, so it is
             // drawn again once the network is back -- and the URL is not
             // remembered as empty.
             stats.blocked += 1
             done.markUnavailable()
+            lock.lock()
+            drawnWithout.remove(key)
+            lock.unlock()
             return nil
         }
-        guard let bytes = fetched, !bytes.isEmpty else {
+        guard let bytes = response.body, !bytes.isEmpty else {
             if cancellation.isCancelled { return nil }
             // Only a genuine "no tile" answer is remembered. A transient
             // failure blacklisted here would leave a hole for the session.
             lock.lock()
-            empties.insert(key)
+            empties.insert(true, for: key, cost: key.utf8.count + 128)
+            drawnWithout.remove(key)
             lock.unlock()
+            done.publish(nil)
             return nil
         }
-        cache.setObject(bytes as NSData, forKey: key as NSString, cost: bytes.count)
-        sourceDiskCache?.put(key, bytes)
+        cache.insert(bytes, for: key, cost: bytes.count + key.utf8.count + 128)
+        sourceDiskCache?.put(key, bytes, meta: SourceTileDiskCache.Meta(
+            etag: response.validators.etag,
+            lastModified: response.validators.lastModified,
+            fetchedAt: Date().timeIntervalSince1970,
+            maxAge: response.maxAge
+        ))
+        done.publish(bytes)
+        sourceLanded(key)
         return bytes
+    }
+
+    /// A source arrived. Worth a handover only if a tile was drawn without it.
+    private func sourceLanded(_ key: String) {
+        lock.lock()
+        let wanted = drawnWithout.remove(key) != nil
+        lock.unlock()
+        if wanted { sourcesArrived() }
+    }
+
+    /**
+     Checks a stale cached tile with the server, off every path a tile waits on.
+
+     The cached bytes have already been drawn; this only decides whether they
+     are still right. A 304 refreshes the sidecar, new bytes replace the old
+     ones and redraw the map, and any failure -- offline included -- leaves the
+     cache exactly as it was.
+     */
+    private func revalidate(_ url: URL, key: String, cached: Data, meta: SourceTileDiskCache.Meta?) {
+        guard let revalidator, let disk = sourceDiskCache else { return }
+        lock.lock()
+        let mine = !closed && revalidating.insert(key).inserted
+        lock.unlock()
+        guard mine else { return }
+        revalidationQueue.addOperation { [weak self] in
+            defer {
+                self?.lock.lock()
+                self?.revalidating.remove(key)
+                self?.lock.unlock()
+            }
+            guard let self, !self.isClosed,
+                  let response = try? revalidator(url, meta?.validators ?? .none)
+            else { return }
+            let now = Date().timeIntervalSince1970
+            if response.notModified {
+                disk.confirm(key, meta: SourceTileDiskCache.Meta(
+                    etag: response.validators.etag ?? meta?.etag,
+                    lastModified: response.validators.lastModified ?? meta?.lastModified,
+                    fetchedAt: now,
+                    maxAge: response.maxAge ?? meta?.maxAge
+                ))
+                return
+            }
+            guard (200..<300).contains(response.status), let bytes = response.body, !bytes.isEmpty else { return }
+            let fresh = SourceTileDiskCache.Meta(
+                etag: response.validators.etag,
+                lastModified: response.validators.lastModified,
+                fetchedAt: now,
+                maxAge: response.maxAge
+            )
+            // A server without validators answers 200 every time; the same
+            // bytes again are a confirmation, not a change.
+            guard bytes != cached else {
+                disk.confirm(key, meta: fresh)
+                return
+            }
+            disk.put(key, bytes, meta: fresh)
+            self.cache.insert(bytes, for: key, cost: bytes.count + key.utf8.count + 128)
+            self.lock.lock()
+            self.replacedSources = true
+            self.lock.unlock()
+            disk.bumpRevision()
+            self.sourcesArrived()
+        }
+    }
+
+    /// Coalesced like the glyph handover: a viewport's sources land together.
+    private func sourcesArrived() {
+        lock.lock()
+        if sourcesNotifyPending || closed {
+            lock.unlock()
+            return
+        }
+        sourcesNotifyPending = true
+        lock.unlock()
+        fetchQueue.asyncAfter(deadline: .now() + notifyQuiet) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            self.sourcesNotifyPending = false
+            let notify = self.closed ? nil : self.onSourcesLoaded
+            self.lock.unlock()
+            notify?()
+        }
     }
 
     // MARK: - Glyphs and sprites
@@ -983,9 +1281,9 @@ public final class VectorTileProvider: TileProvider {
        which is what decides whether a handover is worth making.
      */
     @discardableResult
-    private func requestGlyphs(z: UInt8, x: UInt32, y: UInt32, tiles: [Data?]) -> Bool {
+    private func requestGlyphs(z: UInt8, x: UInt32, y: UInt32, tiles: [Data?], sourceZoomOffset: Int) -> Bool {
         if glyphsUnavailable || isClosed { return false }
-        let needed = (try? renderer.neededGlyphs(z: z, x: x, y: y, tiles: tiles)) ?? []
+        let needed = (try? renderer.neededGlyphs(z: z, x: x, y: y, tiles: tiles, sourceZoomOffset: sourceZoomOffset)) ?? []
         if needed.isEmpty { return false }
 
         lock.lock()
@@ -1135,6 +1433,19 @@ private final class SourceFetchFlight: @unchecked Sendable {
     private let done = DispatchSemaphore(value: 0)
     private let lock = NSLock()
     private var unavailable = false
+    private var received = false
+    private var bytes: Data?
+
+    func publish(_ bytes: Data?) {
+        lock.lock(); defer { lock.unlock() }
+        self.bytes = bytes
+        received = true
+    }
+
+    var response: (received: Bool, bytes: Data?) {
+        lock.lock(); defer { lock.unlock() }
+        return (received, bytes)
+    }
 
     func wait(timeout: DispatchTime) -> DispatchTimeoutResult { done.wait(timeout: timeout) }
     func signal() { done.signal() }
@@ -1169,21 +1480,26 @@ final class FetchCancellation: @unchecked Sendable {
 private final class FetchResults: @unchecked Sendable {
     private let lock = NSLock()
     private var values: [Data?]
+    /// Answered, even if the answer was "nothing": what is not settled is
+    /// still on its way.
+    private var settled: [Bool]
 
     init(count: Int) {
         values = [Data?](repeating: nil, count: count)
+        settled = [Bool](repeating: false, count: count)
     }
 
     func set(_ value: Data?, at index: Int) {
         lock.lock()
         values[index] = value
+        settled[index] = true
         lock.unlock()
     }
 
-    func snapshot() -> [Data?] {
+    func snapshot() -> (values: [Data?], settled: [Bool]) {
         lock.lock()
         defer { lock.unlock() }
-        return values
+        return (values, settled)
     }
 }
 
@@ -1209,4 +1525,20 @@ private final class Counter {
         count -= 1
         lock.unlock()
     }
+}
+
+/**
+ The document as it will be drawn: `styleJSON` with `rules` applied.
+
+ Applied to the document rather than sent as per-layer deltas: both ways a
+ style reaches a map from here -- rasterised tiles and the handover to a map
+ that draws styles itself -- take a document, so applying it once means both
+ see the same one. A rule that hides a role switches those layers off in the
+ document, and a layer that is not there is not drawn.
+
+ Without rules the author's own text comes back and the compiler never runs.
+ */
+func drawnStyleJSON(_ styleJSON: String, _ rules: StyleRules) throws -> String {
+    guard rules != .none else { return styleJSON }
+    return try VectorStyleRules.compile(styleJSON: styleJSON, rulesJSON: rules.json).styleJSON
 }

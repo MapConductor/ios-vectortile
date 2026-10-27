@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 import MapConductorCore
 import MapConductorVectorStyle
 
@@ -81,6 +82,7 @@ public final class VectorTileRasteriser: VectorStyleRasteriser {
         private var displayedStyle: RasterStyleSnapshot?
         private var credits: [AttributionRule] = []
         private var resolvedTileSize = VectorTileProvider.defaultTileSize
+        private var declaredTileSize = VectorTileProvider.defaultTileSize
 
         /**
          Bumped whenever the pixels change for the same geometry.
@@ -101,10 +103,21 @@ public final class VectorTileRasteriser: VectorStyleRasteriser {
         func start(styleJSON: String) {
             work.async { [weak self] in
                 guard let self else { return }
+                let preference = host.serviceRegistry.get(RasterTilePreferenceKey.self)
                 resolvedTileSize =
                     options.tileSize
-                    ?? host.serviceRegistry.get(RasterTilePreferenceKey.self)?.preferredTileSize
+                    ?? preference?.preferredTileSize
                     ?? VectorTileProvider.defaultTileSize
+                // What the map is told. The point size for a map that lays
+                // tiles out in points, the pixel size for one that lays them
+                // out in physical pixels -- which is the provider's to say,
+                // through `RasterTilePreference.layoutInDevicePixels`. The
+                // tile URL always carries `resolvedTileSize`: that is what
+                // the provider renders at.
+                declaredTileSize =
+                    preference?.layoutInDevicePixels == true
+                    ? Int((Double(resolvedTileSize) * UIScreen.main.scale).rounded())
+                    : resolvedTileSize
                 do {
                     try apply(styleJSON: styleJSON, revision: nil)
                 } catch {
@@ -186,6 +199,7 @@ public final class VectorTileRasteriser: VectorStyleRasteriser {
             guard affects != .none else { return }
             let created = try build(styleJSON: styleJSON)
             watchGlyphs(of: created)
+            watchSources(of: created)
 
             lock.lock()
             guard !disposed, requestedRevision == nil || requestedRevision == revision else {
@@ -237,6 +251,30 @@ public final class VectorTileRasteriser: VectorStyleRasteriser {
             }
         }
 
+        /// Tiles drawn before slow sources arrived are missing geometry as
+        /// well as labels, so both halves are refetched -- unlike glyphs,
+        /// which only ever change the overlay.
+        private func watchSources(of created: VectorTileProvider) {
+            created.onSourcesLoaded = { [weak self, weak created] in
+                guard let self else { return }
+                work.async { [weak self, weak created] in
+                    guard let self, let created else { return }
+                    lock.lock()
+                    guard !disposed, provider === created else { lock.unlock(); return }
+                    groundGeneration += 1
+                    labelGeneration += 1
+                    let ground = groundState()
+                    let labels = labelState()
+                    lock.unlock()
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, !isDisposed() else { return }
+                        host.upsertRaster(ground)
+                        host.upsertRaster(labels)
+                    }
+                }
+            }
+        }
+
         private func isDisposed() -> Bool {
             lock.lock()
             defer { lock.unlock() }
@@ -252,7 +290,7 @@ public final class VectorTileRasteriser: VectorStyleRasteriser {
                         tileSize: resolvedTileSize,
                         cacheKey: "g\(groundGeneration)"
                     ),
-                    tileSize: resolvedTileSize,
+                    tileSize: declaredTileSize,
                     maxZoom: Self.maxZoom,
                     attributionRules: credits
                 ),
@@ -272,7 +310,7 @@ public final class VectorTileRasteriser: VectorStyleRasteriser {
                         tileSize: resolvedTileSize,
                         cacheKey: "g\(labelGeneration)"
                     ),
-                    tileSize: resolvedTileSize,
+                    tileSize: declaredTileSize,
                     maxZoom: Self.maxZoom,
                     // Both halves carry the credit, so hiding either one
                     // cannot silence it; the overlay ends in `distinct`.
