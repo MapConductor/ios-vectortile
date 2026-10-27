@@ -1,7 +1,7 @@
 import MapConductorCore
 import XCTest
 
-import MapConductorVectorTile
+@testable import MapConductorVectorTile
 
 /**
  Covers what the provider gained when iOS caught up with Android: the split
@@ -201,22 +201,27 @@ final class SplitLayerTests: XCTestCase {
             }
             return tile
         }
-        defer {
-            for _ in 0..<7 { release.signal() }
-            subject.close()
-        }
-        let drawn = expectation(description: "labels drawn while fonts are still loading")
+        // A tile now waits for its glyph ranges -- that is what draws it once,
+        // with its labels -- but only up to the deadline, and the wait is the
+        // tile's own: queueing a seventh range behind six stalled transfers
+        // must not add their timeouts to it.
+        subject.sourceDeadline = 0.5
+        let drawn = expectation(description: "labels drawn at the deadline while fonts are still loading")
         let request = target
+        let started = Date()
+        var elapsed: TimeInterval = 0
         DispatchQueue.global().async {
             XCTAssertNotNil(subject.labelTiles.renderTile(request: request))
+            elapsed = Date().timeIntervalSince(started)
             drawn.fulfill()
         }
         for _ in 0..<6 {
             XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
         }
-        // All six network slots are occupied. Enqueuing the seventh range
-        // must not make a tile wait for those transfers to finish.
-        wait(for: [drawn], timeout: 1)
+        wait(for: [drawn], timeout: 2)
+        XCTAssertLessThan(elapsed, 1.5)
+        for _ in 0..<7 { release.signal() }
+        subject.close()
     }
 
     /// Two halves of the same tile want the same sources. Fetching them twice

@@ -165,36 +165,54 @@ public final class VectorTileProvider: TileProvider {
     /// moment would otherwise both pay for it.
     private var inFlight: [String: SourceFetchFlight] = [:]
 
-    /// Told when glyphs arrive and tiles drawn before them are now stale.
-    ///
-    /// The host must make the map refetch: the tiles already on screen were
-    /// drawn without those labels, and nothing else will replace them.
+    /**
+     Told when glyphs arrive that tiles already on screen were drawn without.
+
+     Not the normal path. A tile waits for the ranges its labels need (see
+     ``sourceDeadline``) and is drawn once, with them; this fires only when
+     one gave up waiting -- the deadline passed, or the network is off -- and
+     the ranges it lacked have since landed. The host must then make the map
+     refetch the labels, since nothing else will replace those tiles.
+     */
     public var onGlyphsLoaded: (() -> Void)?
 
     /**
      Told when source tiles arrive that tiles already on screen were drawn
      without, or when a cached tile turned out to have changed upstream.
 
-     A tile whose sources are slow is drawn after ``sourceGrace`` with what
-     has arrived, rather than leaving the map blank for a network round trip
-     (or a fifteen-second timeout on a Wi-Fi that answers nothing). Like
-     ``onGlyphsLoaded``, the host must make the map refetch -- *both* halves,
-     since the ground is missing geometry too.
+     Not the normal path either: a tile waits for its sources and is drawn
+     once, complete. It is drawn short only when ``sourceDeadline`` passes on
+     a connection that answers nothing, or a source is refused offline; such a
+     tile is not kept, and this asks the host to make the map refetch *both*
+     halves once the missing data lands. A background revalidation that finds
+     new bytes upstream asks the same, which is rare.
      */
     public var onSourcesLoaded: (() -> Void)?
 
     /**
-     How long a tile waits for sources that are not on the device before it
-     is drawn without them.
+     How long a tile waits for the source tiles and glyph ranges that are not
+     on the device before it is drawn without them.
 
-     Long enough that a healthy connection still delivers whole tiles; short
-     enough that a stalled one cannot hold the tile server's render lane. A
-     tile drawn short is not kept, and redrawn once its sources land.
+     Long enough for any working connection -- about a fetch's own timeout --
+     so a tile is drawn once, complete, and the map is never asked to reload a
+     layer to fill in what arrived a moment late. The wait happens in
+     ``prepareTile(request:isCancelled:)``, outside the tile server's render
+     lane, so a tile waiting here holds back no tile that the device could
+     draw at once.
      */
-    public static let sourceGrace: TimeInterval = 0.4
+    public static let sourceDeadline: TimeInterval = 10
 
-    /// ``sourceGrace``, adjustable by the tests that are about something else.
-    var sourceGrace: TimeInterval = VectorTileProvider.sourceGrace
+    /// ``sourceDeadline``, adjustable by the tests that are about something else.
+    var sourceDeadline: TimeInterval = VectorTileProvider.sourceDeadline
+
+    /// Tiles that went through ``prepareTile(request:isCancelled:)``: their
+    /// data has been waited for already, so the render that follows -- inside
+    /// the server's lane -- takes what is there and does not wait again.
+    private let preparedTiles = TileMemoryCache<Bool>(byteLimit: 256 << 10, countLimit: 1024, ttl: 30)
+
+    /// Glyph ranges being fetched right now, so a tile that needs one can wait
+    /// for somebody else's fetch instead of drawing without it.
+    private var glyphsFetching = Set<String>()
 
     /// Source URLs a tile was drawn without, so their arrival is worth a handover.
     private var drawnWithout = Set<String>()
@@ -511,6 +529,10 @@ public final class VectorTileProvider: TileProvider {
         func renderTile(request: TileRequest, isCancelled: () -> Bool) -> Data? {
             owner?.renderTile(request: request, content: content, isCancelled: isCancelled)
         }
+
+        func prepareTile(request: TileRequest, isCancelled: () -> Bool) {
+            owner?.prepareTile(request: request, content: content, isCancelled: isCancelled)
+        }
     }
 
     public func renderTile(request: TileRequest) -> Data? {
@@ -519,6 +541,153 @@ public final class VectorTileProvider: TileProvider {
 
     public func renderTile(request: TileRequest, isCancelled: () -> Bool) -> Data? {
         renderTile(request: request, content: .full, isCancelled: isCancelled)
+    }
+
+    public func prepareTile(request: TileRequest, isCancelled: () -> Bool) {
+        prepareTile(request: request, content: .full, isCancelled: isCancelled)
+    }
+
+    /**
+     Fetches what one tile needs -- its source tiles and, for labels, the
+     glyph ranges they use -- and waits for them, up to ``sourceDeadline``.
+
+     The tile server calls this before it takes a render slot, so the wait
+     holds no CPU lane. The ``renderTile(request:content:isCancelled:)`` that
+     follows finds everything in memory and draws the tile once, complete.
+     A tile already drawn and kept needs nothing and returns at once.
+     */
+    public func prepareTile(
+        request: TileRequest,
+        content: Content = .full,
+        isCancelled: () -> Bool = { false }
+    ) {
+        autoreleasepool {
+            if isClosed || isCancelled() { return }
+            let keys = renderedKeys(request: request, content: content)
+            for candidate in [keys.complete, keys.provisional].compactMap({ $0 }) where diskCache?.contains(candidate) == true {
+                return
+            }
+            guard let gathered = gather(request: request, content: content, waitFor: sourceDeadline, isCancelled: isCancelled)
+            else { return }
+            _ = gathered
+            preparedTiles.insert(true, for: keys.prepared, cost: keys.prepared.utf8.count + 64)
+        }
+    }
+
+    /// The cache keys one tile is stored and found under.
+    private func renderedKeys(
+        request: TileRequest, content: Content
+    ) -> (complete: String?, provisional: String?, ground: String, prepared: String) {
+        // Changes only when a revalidation found new bytes upstream; tiles
+        // drawn from the old ones then stop being found.
+        let sourceRevision = sourceDiskCache?.revision ?? 0
+
+        /*
+         Two keys, because a rendered tile goes stale for one reason only: it
+         was drawn while some of its glyphs were still on the way. A tile that
+         had them all is finished, and no later arrival can change it, so it is
+         stored under a key with no generation in it and survives every
+         handover. Only the ones drawn short are tied to the generation they
+         were drawn at, and only they are redrawn.
+         */
+        func key(_ generation: String) -> String {
+            Digest.hex(
+                styleKey,
+                "\(tileSize)",
+                // A build that draws more than the one that filled this cache
+                // must not serve its tiles.
+                "v\(VectorTileRenderer.outputVersion)",
+                generation,
+                "scale\(renderScale)",
+                "sourceOffset\(request.sourceZoomOffset)",
+                "sources\(sourceRevision)",
+                "\(request.z)/\(request.x)/\(request.y)"
+            )
+        }
+        let complete: String? = diskCache.map { _ in
+            switch content {
+            // The ground has no glyphs to be short of; one key, forever.
+            case .ground: return key("ground")
+            case .labels: return key("labels-complete")
+            case .full: return key("complete")
+            }
+        }
+        let provisional: String? = diskCache.flatMap { _ in
+            switch content {
+            case .ground: return nil
+            case .labels: return key("labels-g\(glyphGeneration.value)")
+            case .full: return key("g\(glyphGeneration.value)")
+            }
+        }
+        let prepared = "\(content)|\(request.sourceZoomOffset)|\(request.z)/\(request.x)/\(request.y)"
+        return (complete, provisional, key("ground"), prepared)
+    }
+
+    /// What a tile is drawn from, and whether it had to be drawn without some of it.
+    private struct Gathered {
+        let plan: [[String: Any]]
+        let wanted: [URL?]
+        let tiles: [Data?]
+        let stats: SourceFetchStats
+        let fetchMs: Int
+        /// Some glyph range its labels use was still missing when it stopped waiting.
+        let shortOfGlyphs: Bool
+    }
+
+    /**
+     The source tiles of a tile's plan and the glyph ranges its labels use,
+     waited for up to `waitFor`. Nil when the tile was cancelled or has no plan.
+     */
+    private func gather(
+        request: TileRequest, content: Content, waitFor: TimeInterval, isCancelled: () -> Bool
+    ) -> Gathered? {
+        let z = UInt8(clamping: request.z)
+        let x = UInt32(clamping: request.x)
+        let y = UInt32(clamping: request.y)
+        let sourceZoomOffset = request.sourceZoomOffset
+        guard let plan = plan(z: z, x: x, y: y, sourceZoomOffset: sourceZoomOffset) else { return nil }
+
+        // The ground never draws a label, so the ring of neighbours the label
+        // pass asks for is nine fetches it has no use for. The entries stay in
+        // place — the native side reads the plan positionally — but hold
+        // nothing.
+        let wanted = plan.map { entry in
+            content == .ground && (entry["labelsOnly"] as? Bool ?? false)
+                ? nil
+                : (entry["url"] as? String).flatMap(VectorTileProvider.parse)
+        }
+        let priorities = plan.enumerated().map { index, entry in
+            ((entry["labelsOnly"] as? Bool ?? false) ? 1_000 : 0) + index
+        }
+        let started = Date()
+        let fetchStarted = DispatchTime.now()
+        let stats = SourceFetchStats()
+        guard let tiles = fetchAll(
+            wanted, priorities: priorities, stats: stats, waitFor: waitFor, isCancelled: isCancelled
+        ) else {
+            VectorTileProvider.debug(
+                "tile \(request.z)/\(request.x)/\(request.y) content=\(content) cancelled "
+                    + "mvt(mem=\(stats.memoryHits) disk=\(stats.diskHits) "
+                    + "net=\(stats.networkFetches) shared=\(stats.sharedWaits) "
+                    + "blocked=\(stats.blocked) cancel=\(stats.cancelled) "
+                    + "queue=\(stats.queueWaitMs)ms)"
+            )
+            return nil
+        }
+        let fetchMs = VectorTileProvider.millis(since: fetchStarted)
+        if isClosed || isCancelled() { return nil }
+
+        // The ground has no glyphs, so it never waits for them.
+        var shortOfGlyphs = false
+        if content != .ground {
+            let left = max(0, waitFor - Date().timeIntervalSince(started))
+            guard let short = awaitGlyphs(
+                z: z, x: x, y: y, tiles: tiles, sourceZoomOffset: sourceZoomOffset,
+                waitFor: left, isCancelled: isCancelled
+            ) else { return nil }
+            shortOfGlyphs = short
+        }
+        return Gathered(plan: plan, wanted: wanted, tiles: tiles, stats: stats, fetchMs: fetchMs, shortOfGlyphs: shortOfGlyphs)
     }
 
     /**
@@ -546,88 +715,31 @@ public final class VectorTileProvider: TileProvider {
         if isClosed || isCancelled() { return nil }
 
         let sourceZoomOffset = request.sourceZoomOffset
-        // Changes only when a revalidation found new bytes upstream; tiles
-        // drawn from the old ones then stop being found.
-        let sourceRevision = sourceDiskCache?.revision ?? 0
         let z = UInt8(clamping: request.z)
         let x = UInt32(clamping: request.x)
         let y = UInt32(clamping: request.y)
 
-        /*
-         Two keys, because a rendered tile goes stale for one reason only: it
-         was drawn while some of its glyphs were still on the way. A tile that
-         had them all is finished, and no later arrival can change it, so it is
-         stored under a key with no generation in it and survives every
-         handover. Only the ones drawn short are tied to the generation they
-         were drawn at, and only they are redrawn.
-         */
-        func key(_ generation: String) -> String {
-            Digest.hex(
-                styleKey,
-                "\(tileSize)",
-                // A build that draws more than the one that filled this cache
-                // must not serve its tiles.
-                "v\(VectorTileRenderer.outputVersion)",
-                generation,
-                "scale\(renderScale)",
-                "sourceOffset\(sourceZoomOffset)",
-                "sources\(sourceRevision)",
-                "\(request.z)/\(request.x)/\(request.y)"
-            )
-        }
-        let completeKey: String? = diskCache.map { _ in
-            switch content {
-            // The ground has no glyphs to be short of; one key, forever.
-            case .ground: return key("ground")
-            case .labels: return key("labels-complete")
-            case .full: return key("complete")
-            }
-        }
-        let provisionalKey: String? = diskCache.flatMap { _ in
-            switch content {
-            case .ground: return nil
-            case .labels: return key("labels-g\(glyphGeneration.value)")
-            case .full: return key("g\(glyphGeneration.value)")
-            }
-        }
+        let keys = renderedKeys(request: request, content: content)
+        let completeKey = keys.complete
+        let provisionalKey = keys.provisional
         for candidate in [completeKey, provisionalKey].compactMap({ $0 }) {
             if let hit = diskCache?.get(candidate) { return hit }
         }
 
-        guard let plan = plan(z: z, x: x, y: y, sourceZoomOffset: sourceZoomOffset) else { return nil }
+        // Prepared tiles have had their wait, outside the render lane; here
+        // they take what came. Anyone calling this directly waits here instead.
+        let prepared = preparedTiles.value(for: keys.prepared) == true
+        if prepared { preparedTiles.remove(keys.prepared) }
+        guard let gathered = gather(
+            request: request, content: content, waitFor: prepared ? 0 : sourceDeadline, isCancelled: isCancelled
+        ) else { return nil }
+        let plan = gathered.plan
+        let wanted = gathered.wanted
+        let tiles = gathered.tiles
+        let fetchStats = gathered.stats
+        let fetchMs = gathered.fetchMs
 
-        // The ground never draws a label, so the ring of neighbours the label
-        // pass asks for is nine fetches it has no use for. The entries stay in
-        // place — the native side reads the plan positionally — but hold
-        // nothing.
-        let wanted = plan.map { entry in
-            content == .ground && (entry["labelsOnly"] as? Bool ?? false)
-                ? nil
-                : (entry["url"] as? String).flatMap(VectorTileProvider.parse)
-        }
-        let priorities = plan.enumerated().map { index, entry in
-            ((entry["labelsOnly"] as? Bool ?? false) ? 1_000 : 0) + index
-        }
-        let fetchStarted = DispatchTime.now()
-        let fetchStats = SourceFetchStats()
-        guard let tiles = fetchAll(wanted, priorities: priorities, stats: fetchStats, isCancelled: isCancelled) else {
-            VectorTileProvider.debug(
-                "tile \(request.z)/\(request.x)/\(request.y) content=\(content) cancelled "
-                    + "mvt(mem=\(fetchStats.memoryHits) disk=\(fetchStats.diskHits) "
-                    + "net=\(fetchStats.networkFetches) shared=\(fetchStats.sharedWaits) "
-                    + "blocked=\(fetchStats.blocked) cancel=\(fetchStats.cancelled) "
-                    + "queue=\(fetchStats.queueWaitMs)ms)"
-            )
-            return nil
-        }
-        let fetchMs = VectorTileProvider.millis(since: fetchStarted)
-        if isClosed || isCancelled() { return nil }
-
-        // Cached ranges belong in the store before the tile is judged to be
-        // missing them; otherwise the first tile of a launch is drawn bare and
-        // handed over a moment later for no reason. The ground has no glyphs,
-        // so it never waits.
-        let short = content != .ground && requestGlyphs(z: z, x: x, y: y, tiles: tiles, sourceZoomOffset: sourceZoomOffset)
+        let short = gathered.shortOfGlyphs
         if short {
             lock.lock()
             provisionalSinceHandover = true
@@ -637,12 +749,12 @@ public final class VectorTileProvider: TileProvider {
 
         let renderStarted = DispatchTime.now()
         let png: Data?
-        let groundKey = key("ground")
+        let groundKey = keys.ground
         // A tile drawn while the network was off and a source was not in the
         // package is missing ink, like one drawn short of glyphs -- but
         // nothing will arrive to redraw it, so it must not be kept at all.
-        // So is one drawn before slow sources arrived; those are on their way
-        // and `onSourcesLoaded` brings the finished tile.
+        // So is one that gave up on sources at the deadline; those are on
+        // their way and `onSourcesLoaded` brings the finished tile.
         let drawnShortOfSources = fetchStats.blocked > 0 || fetchStats.pending > 0
         lock.lock()
         let keep = !drawnShortOfSources && !replacedSources
@@ -851,6 +963,7 @@ public final class VectorTileProvider: TileProvider {
         _ urls: [URL?],
         priorities: [Int],
         stats: SourceFetchStats,
+        waitFor: TimeInterval,
         isCancelled: () -> Bool
     ) -> [Data?]? {
         let results = FetchResults(count: urls.count)
@@ -918,7 +1031,7 @@ public final class VectorTileProvider: TileProvider {
         }
 
         // Everything below waits on the network, and no longer than this.
-        let deadline = DispatchTime.now() + sourceGrace
+        let deadline = DispatchTime.now() + waitFor
         func expired() -> Bool { DispatchTime.now() >= deadline }
 
         while group.wait(timeout: .now() + .milliseconds(10)) != .success {
@@ -1209,7 +1322,7 @@ public final class VectorTileProvider: TileProvider {
             if let cache = self.glyphCache, (try? self.renderer.glyphsURLTemplate()) != nil {
                 // Nothing to enumerate a disk cache by — the ranges a style
                 // wants are only known per tile — so warming happens as tiles
-                // ask, through `requestGlyphs`, which checks the cache first.
+                // ask, through `awaitGlyphs`, which checks the cache first.
                 _ = cache
             }
             self.loadSprite()
@@ -1269,27 +1382,56 @@ public final class VectorTileProvider: TileProvider {
     }
 
     /**
-     Starts fetching the glyph ranges this tile's labels need, and returns.
+     Fetches the glyph ranges this tile's labels need and waits for them, up
+     to `waitFor`.
 
-     Waiting is the obvious thing and the wrong one: a range is a 0.4-1.3 second
-     round trip, a tile at low zoom wants dozens, and waiting means the tile
-     draws nothing until the last one lands. The tile is drawn with whatever is
-     already in, exactly as MapLibre does it, and the ranges that arrive later
-     bring their labels with them through `onGlyphsLoaded`.
+     A tile used to be drawn with whatever ranges were already in and handed
+     over later, through `onGlyphsLoaded`, once the rest landed -- which made
+     the map reload the whole label layer after every zoom. Waiting here (in
+     ``prepareTile(request:isCancelled:)``, outside the render lane) draws it
+     once, with its labels. Ranges are shared: a tile that needs one another
+     tile is already fetching waits for that fetch rather than starting its own.
 
-     - Returns: whether this tile is about to be drawn without glyphs it wants,
-       which is what decides whether a handover is worth making.
+     - Returns: whether the tile is about to be drawn without ranges it wants
+       (the wait ran out, or a range could not be had), which is what makes a
+       later handover worth it; nil if the tile was cancelled meanwhile.
      */
-    @discardableResult
-    private func requestGlyphs(z: UInt8, x: UInt32, y: UInt32, tiles: [Data?], sourceZoomOffset: Int) -> Bool {
+    private func awaitGlyphs(
+        z: UInt8, x: UInt32, y: UInt32, tiles: [Data?], sourceZoomOffset: Int,
+        waitFor: TimeInterval, isCancelled: () -> Bool
+    ) -> Bool? {
         if glyphsUnavailable || isClosed { return false }
-        let needed = (try? renderer.neededGlyphs(z: z, x: x, y: y, tiles: tiles, sourceZoomOffset: sourceZoomOffset)) ?? []
-        if needed.isEmpty { return false }
+        let deadline = Date().addingTimeInterval(waitFor)
+        // Ranges this wait has already asked for once. A range refused while
+        // offline is unclaimed again for later, and must not be refetched in
+        // a loop here.
+        var asked = Set<String>()
+        while true {
+            let needed = (try? renderer.neededGlyphs(
+                z: z, x: x, y: y, tiles: tiles, sourceZoomOffset: sourceZoomOffset
+            )) ?? []
+            if needed.isEmpty { return false }
+            startGlyphFetches(needed.filter { asked.insert($0).inserted })
 
+            lock.lock()
+            let coming = needed.contains { glyphsFetching.contains($0) }
+            lock.unlock()
+            // Nothing that is missing is on its way: the server has no such
+            // range, or the network is off. Waiting would change nothing.
+            if !coming || Date() >= deadline { return true }
+            if isClosed || isCancelled() { return nil }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+    }
+
+    /// Claims and fetches whichever of these ranges nobody has claimed yet.
+    private func startGlyphFetches(_ urls: [String]) {
         lock.lock()
-        let mine = needed.filter { requestedGlyphs.insert($0).inserted }
+        let mine = urls.filter { requestedGlyphs.insert($0).inserted }
+        // Marked on this thread, before the queue runs, so a waiter that looks
+        // straight after sees them coming.
+        glyphsFetching.formUnion(mine)
         lock.unlock()
-        if mine.isEmpty { return true }
 
         for url in mine {
             glyphsInFlight.increment()
@@ -1297,7 +1439,14 @@ public final class VectorTileProvider: TileProvider {
             // permit on the render thread holds a server slot for an entire
             // network round trip (or timeout) before any pixels are returned.
             glyphQueue.addOperation {
-                defer { self.glyphsInFlight.decrement() }
+                defer {
+                    // After the range is in the store, so a waiter that sees
+                    // it gone finds it there.
+                    self.lock.lock()
+                    self.glyphsFetching.remove(url)
+                    self.lock.unlock()
+                    self.glyphsInFlight.decrement()
+                }
                 guard !self.isClosed else { return }
                 // Ranges never change, so a hit here is kept without expiry.
                 let bytes = self.glyphCache?.get(url) ?? self.fetched(url, into: self.glyphCache)
@@ -1309,7 +1458,6 @@ public final class VectorTileProvider: TileProvider {
                 }
             }
         }
-        return true
     }
 
     /**
