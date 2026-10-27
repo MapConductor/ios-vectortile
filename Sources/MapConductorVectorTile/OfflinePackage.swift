@@ -189,6 +189,7 @@ public final class OfflinePackage: @unchecked Sendable {
     public final class Fetcher: @unchecked Sendable {
         private let package: OfflinePackage
         private let upstream: (URL) -> Data?
+        private let headers: [String: String]
         private let onStats: ((Stats) -> Void)?
         private let lock = NSLock()
         private var counters = Stats()
@@ -216,8 +217,34 @@ public final class OfflinePackage: @unchecked Sendable {
         ) {
             self.package = package
             self._online = online
+            self.headers = headers
             self.upstream = upstream ?? { url in VectorTileProvider.get(url, headers: headers, cancellation: nil) }
             self.onStats = onStats
+        }
+
+        /**
+         The package's answer, and nothing else: for ``VectorTileProvider``'s
+         `localTile`, which reads it before any network slot so the area on
+         the device is drawn however slow the network is.
+         */
+        public func local(_ url: URL) -> Data? {
+            guard let packaged = package.bytes(for: url.absoluteString) else { return nil }
+            bump { $0.packageHits += 1 }
+            return packaged
+        }
+
+        /**
+         A conditional request for ``VectorTileProvider``'s `revalidate`:
+         refused while offline, so a cached tile is not checked over a
+         network the app has been told not to use.
+
+         Package tiles never get here -- `local` answers them first -- so
+         what is checked is only what was fetched around the package.
+         */
+        public func revalidate(_ url: URL, validators: SourceValidators) throws -> SourceResponse {
+            guard online else { throw OfflineUnavailableError(url: url.absoluteString) }
+            bump { $0.networkFetches += 1 }
+            return try VectorTileProvider.conditionalFetch(url, validators: validators, headers: headers)
         }
 
         public func fetch(_ url: URL) throws -> Data? {

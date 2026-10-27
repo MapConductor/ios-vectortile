@@ -51,6 +51,10 @@ public final class VectorStyleHandoff {
          mode: a map remembers a tile it was told does not exist, so going back
          online has to change the URLs to be noticed.
        - headers: sent with upstream fetches made for the package
+       - sourceCacheDirectory: where tiles fetched around the package are
+         kept, so the map is answered from the device first and the network
+         is only asked -- in the background, with `If-None-Match` /
+         `If-Modified-Since` -- whether they changed. Nil fetches every time.
      */
     public init(
         styleJSON: String,
@@ -65,7 +69,9 @@ public final class VectorStyleHandoff {
         server: LocalTileServer = TileServerRegistry.get(),
         offlinePackage: OfflinePackage? = nil,
         online: Bool = true,
-        headers: [String: String] = [:]
+        headers: [String: String] = [:],
+        sourceCacheDirectory: URL? = nil,
+        sourceCacheBytes: Int = 128 * 1024 * 1024
     ) {
         self.support = support
         self.server = server
@@ -87,12 +93,20 @@ public final class VectorStyleHandoff {
             filesRoute = route
             var fallback: (@Sendable (String) -> Data?)?
             if online {
+                // The local server runs this on its concurrent queue, outside
+                // the render lane, and answers package files on the
+                // connection itself -- a stalled upstream here cannot hold
+                // the package back. The cache keeps it from being asked twice.
+                let upstreamCache = UpstreamCache(
+                    disk: sourceCacheDirectory.flatMap { SourceTileDiskCache(directory: $0, budgetBytes: sourceCacheBytes) },
+                    headers: headers
+                )
                 fallback = { relative in
                     guard
                         let upstream = offlinePackage.upstreamURL(forRelativePath: relative),
                         let target = VectorTileProvider.parse(upstream)
                     else { return nil }
-                    return VectorTileProvider.get(target, headers: headers, cancellation: nil)
+                    return upstreamCache.bytes(for: target)
                 }
             }
             server.registerFiles(routeId: route, directory: offlinePackage.directory, fallback: fallback)
@@ -143,6 +157,79 @@ public final class VectorStyleHandoff {
             result.append(attribution)
         }
         return result
+    }
+
+    /**
+     What the map asks for and the package does not have: the cached copy at
+     once when there is one -- checked with the server in the background once
+     stale -- and the network otherwise.
+     */
+    private final class UpstreamCache: @unchecked Sendable {
+        private let disk: SourceTileDiskCache?
+        private let headers: [String: String]
+        private let lock = NSLock()
+        private var checking = Set<String>()
+        private let queue: OperationQueue = {
+            let queue = OperationQueue()
+            queue.name = "mapconductor.vectorstyle.revalidate"
+            queue.qualityOfService = .utility
+            queue.maxConcurrentOperationCount = 2
+            return queue
+        }()
+
+        init(disk: SourceTileDiskCache?, headers: [String: String]) {
+            self.disk = disk
+            self.headers = headers
+        }
+
+        func bytes(for url: URL) -> Data? {
+            let key = url.absoluteString
+            guard let disk else {
+                return VectorTileProvider.get(url, headers: headers, cancellation: nil)
+            }
+            if let entry = disk.entry(key) {
+                if entry.meta?.isStale() ?? true { check(url, key: key, entry: entry, disk: disk) }
+                return entry.bytes
+            }
+            guard let response = try? VectorTileProvider.conditionalFetch(url, validators: .none, headers: headers),
+                  let body = response.body, !body.isEmpty
+            else { return nil }
+            disk.put(key, body, meta: SourceTileDiskCache.Meta(
+                etag: response.validators.etag, lastModified: response.validators.lastModified,
+                fetchedAt: Date().timeIntervalSince1970, maxAge: response.maxAge
+            ))
+            return body
+        }
+
+        private func check(_ url: URL, key: String, entry: (bytes: Data, meta: SourceTileDiskCache.Meta?), disk: SourceTileDiskCache) {
+            lock.lock()
+            let mine = checking.insert(key).inserted
+            lock.unlock()
+            guard mine else { return }
+            queue.addOperation { [headers] in
+                defer {
+                    self.lock.lock()
+                    self.checking.remove(key)
+                    self.lock.unlock()
+                }
+                guard let response = try? VectorTileProvider.conditionalFetch(
+                    url, validators: entry.meta?.validators ?? .none, headers: headers
+                ) else { return }
+                let meta = SourceTileDiskCache.Meta(
+                    etag: response.validators.etag ?? entry.meta?.etag,
+                    lastModified: response.validators.lastModified ?? entry.meta?.lastModified,
+                    fetchedAt: Date().timeIntervalSince1970,
+                    maxAge: response.maxAge ?? entry.meta?.maxAge
+                )
+                if response.notModified {
+                    disk.confirm(key, meta: meta)
+                } else if let body = response.body, !body.isEmpty {
+                    // The map was served the old bytes as `no-store`; it gets
+                    // these the next time it asks.
+                    disk.put(key, body, meta: meta)
+                }
+            }
+        }
     }
 
     /// FNV-1a over the UTF-8 bytes: stable across launches, which `hashValue` is not.

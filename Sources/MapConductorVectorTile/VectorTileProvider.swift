@@ -70,6 +70,15 @@ public final class VectorTileProvider: TileProvider {
     private let renderer: VectorTileRenderer
     private let tileSize: Int
     private let fetchTile: (URL, FetchCancellation?) throws -> Data?
+    /// The network for source tiles, with what the server said about caching
+    /// them. Glyphs and the sprite keep using `fetchTile`.
+    private let sourceFetch: (URL, FetchCancellation?) throws -> SourceResponse
+    /// Bytes already on the device -- an offline package -- read at once.
+    private let localTile: ((URL) -> Data?)?
+    /// Asks the server whether a cached tile changed. Nil when the caller
+    /// replaced the network and said nothing about checking: its transport
+    /// is the only one allowed to go out.
+    private let revalidator: ((URL, SourceValidators) throws -> SourceResponse)?
     private let sourceDiskCache: SourceTileDiskCache?
 
     /// Source tiles keyed by URL.
@@ -162,6 +171,61 @@ public final class VectorTileProvider: TileProvider {
     /// drawn without those labels, and nothing else will replace them.
     public var onGlyphsLoaded: (() -> Void)?
 
+    /**
+     Told when source tiles arrive that tiles already on screen were drawn
+     without, or when a cached tile turned out to have changed upstream.
+
+     A tile whose sources are slow is drawn after ``sourceGrace`` with what
+     has arrived, rather than leaving the map blank for a network round trip
+     (or a fifteen-second timeout on a Wi-Fi that answers nothing). Like
+     ``onGlyphsLoaded``, the host must make the map refetch -- *both* halves,
+     since the ground is missing geometry too.
+     */
+    public var onSourcesLoaded: (() -> Void)?
+
+    /**
+     How long a tile waits for sources that are not on the device before it
+     is drawn without them.
+
+     Long enough that a healthy connection still delivers whole tiles; short
+     enough that a stalled one cannot hold the tile server's render lane. A
+     tile drawn short is not kept, and redrawn once its sources land.
+     */
+    public static let sourceGrace: TimeInterval = 0.4
+
+    /// ``sourceGrace``, adjustable by the tests that are about something else.
+    var sourceGrace: TimeInterval = VectorTileProvider.sourceGrace
+
+    /// Source URLs a tile was drawn without, so their arrival is worth a handover.
+    private var drawnWithout = Set<String>()
+    private var sourcesNotifyPending = false
+
+    /**
+     Set once a revalidation replaced bytes this provider may already have
+     drawn from.
+
+     The native renderer keeps decoded source tiles keyed by source and
+     coordinates, not by bytes, and offers no way to forget one -- so until
+     its bounded cache lets the old tile go, a redraw here can still show the
+     old geometry. Nothing drawn from then on is kept on disk: the next
+     provider, which decodes the new bytes, must not be served this one's
+     pictures under the new revision.
+     */
+    private var replacedSources = false
+
+    /// Revalidations under way, so a tile drawn by nine neighbours is checked once.
+    private var revalidating = Set<String>()
+
+    /// Background checks of stale cached tiles. Two at a time: they are never
+    /// what the map is waiting for, and must not crowd out what it is.
+    private let revalidationQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "mapconductor.vectortile.revalidate"
+        queue.qualityOfService = .utility
+        queue.maxConcurrentOperationCount = 2
+        return queue
+    }()
+
     /// How long to let a burst of ranges settle before telling the host.
     ///
     /// A viewport's worth arrives within a second or two of each other, and
@@ -232,7 +296,17 @@ public final class VectorTileProvider: TileProvider {
         /// Replaces the network for source tiles, glyph ranges and the
         /// sprite. Nil means "no such resource" and is remembered; a thrown
         /// ``OfflineUnavailableError`` means "not now" and is not.
-        fetchTile: ((URL) throws -> Data?)? = nil
+        fetchTile: ((URL) throws -> Data?)? = nil,
+        /// Answers from local storage at once -- an offline package -- and is
+        /// consulted before any network slot, so a tile on the device is never
+        /// queued behind fetches waiting on a slow network. Nil means "not here".
+        localTile: ((URL) -> Data?)? = nil,
+        /// Asks the server whether a cached source tile changed, with the
+        /// validators it was stored with. Defaults to plain HTTP with
+        /// `headers` when `fetchTile` is nil; with a custom `fetchTile` and no
+        /// `revalidate`, cached tiles are never checked. Throwing (offline,
+        /// say) leaves the cached tile as it is.
+        revalidate: ((URL, SourceValidators) throws -> SourceResponse)? = nil
     ) throws {
         // The renderer needs the points a tile covers on screen, not the
         // pixels a render asks for (the label pass draws at twice the
@@ -245,11 +319,25 @@ public final class VectorTileProvider: TileProvider {
             // Public test/custom transports keep their existing synchronous
             // contract. The built-in URLSession path below is cancellable.
             self.fetchTile = { url, _ in try fetchTile(url) }
+            self.sourceFetch = { url, _ in
+                let bytes = try fetchTile(url)
+                return SourceResponse(status: bytes == nil ? 404 : 200, body: bytes)
+            }
+            self.revalidator = revalidate
         } else {
             self.fetchTile = { url, cancellation in
                 try VectorTileProvider.fetch(url, headers: headers, cancellation: cancellation)
             }
+            // The built-in path keeps the response headers, so the tile can
+            // be checked later instead of fetched again.
+            self.sourceFetch = { url, cancellation in
+                try VectorTileProvider.conditionalFetch(url, validators: .none, headers: headers, cancellation: cancellation)
+            }
+            self.revalidator = revalidate ?? { url, validators in
+                try VectorTileProvider.conditionalFetch(url, validators: validators, headers: headers)
+            }
         }
+        self.localTile = localTile
         cache = TileMemoryCache<Data>(byteLimit: cacheBytes)
         self.glyphsUnavailable = (try? renderer.glyphsURLTemplate()) == nil
         // The *drawn* document, not the author's: rendered tiles are keyed by
@@ -319,6 +407,8 @@ public final class VectorTileProvider: TileProvider {
         guard !closed else { return false }
         closed = true
         onGlyphsLoaded = nil
+        onSourcesLoaded = nil
+        revalidationQueue.cancelAllOperations()
         empties.removeAll()
         return true
     }
@@ -456,6 +546,9 @@ public final class VectorTileProvider: TileProvider {
         if isClosed || isCancelled() { return nil }
 
         let sourceZoomOffset = request.sourceZoomOffset
+        // Changes only when a revalidation found new bytes upstream; tiles
+        // drawn from the old ones then stop being found.
+        let sourceRevision = sourceDiskCache?.revision ?? 0
         let z = UInt8(clamping: request.z)
         let x = UInt32(clamping: request.x)
         let y = UInt32(clamping: request.y)
@@ -478,6 +571,7 @@ public final class VectorTileProvider: TileProvider {
                 generation,
                 "scale\(renderScale)",
                 "sourceOffset\(sourceZoomOffset)",
+                "sources\(sourceRevision)",
                 "\(request.z)/\(request.x)/\(request.y)"
             )
         }
@@ -547,7 +641,12 @@ public final class VectorTileProvider: TileProvider {
         // A tile drawn while the network was off and a source was not in the
         // package is missing ink, like one drawn short of glyphs -- but
         // nothing will arrive to redraw it, so it must not be kept at all.
-        let drawnShortOfSources = fetchStats.blocked > 0
+        // So is one drawn before slow sources arrived; those are on their way
+        // and `onSourcesLoaded` brings the finished tile.
+        let drawnShortOfSources = fetchStats.blocked > 0 || fetchStats.pending > 0
+        lock.lock()
+        let keep = !drawnShortOfSources && !replacedSources
+        lock.unlock()
         switch content {
         case .labels:
             png = renderLabelTile(z: z, x: x, y: y, tiles: tiles, sourceZoomOffset: sourceZoomOffset)
@@ -557,7 +656,7 @@ public final class VectorTileProvider: TileProvider {
             } else {
                 png = renderGroundTile(
                     z: z, x: x, y: y, tiles: tiles, content: content,
-                    cacheGroundAs: drawnShortOfSources ? nil : groundKey, isCancelled: isCancelled,
+                    cacheGroundAs: keep ? groundKey : nil, isCancelled: isCancelled,
                     sourceZoomOffset: sourceZoomOffset
                 )
             }
@@ -576,11 +675,11 @@ public final class VectorTileProvider: TileProvider {
                 + "fetch=\(fetchMs)ms render=\(renderMs)ms bytes=\(png?.count ?? 0) "
                 + "mvt(mem=\(fetchStats.memoryHits) disk=\(fetchStats.diskHits) "
                 + "net=\(fetchStats.networkFetches) shared=\(fetchStats.sharedWaits) "
-                + "blocked=\(fetchStats.blocked) cancel=\(fetchStats.cancelled) "
-                + "queue=\(fetchStats.queueWaitMs)ms)"
+                + "blocked=\(fetchStats.blocked) pending=\(fetchStats.pending) "
+                + "cancel=\(fetchStats.cancelled) queue=\(fetchStats.queueWaitMs)ms)"
         )
 
-        if let png, !drawnShortOfSources, let store = short ? provisionalKey : completeKey {
+        if let png, keep, let store = short ? provisionalKey : completeKey {
             diskCache?.put(store, png)
         }
         return png
@@ -757,7 +856,10 @@ public final class VectorTileProvider: TileProvider {
         let results = FetchResults(count: urls.count)
         let group = DispatchGroup()
         let cancellation = FetchCancellation()
-        defer { cancellation.cancel() }
+        // Left running when the tile is drawn without them: the bytes are
+        // still wanted, by the redraw `onSourcesLoaded` asks for.
+        var detached = false
+        defer { if !detached { cancellation.cancel() } }
 
         // Sorted on this thread, before anything is dispatched: what is
         // already here, what somebody else is fetching, and what is ours to
@@ -780,14 +882,19 @@ public final class VectorTileProvider: TileProvider {
         for index in ordered {
             guard let url = urls[index] else { continue }
             let key = url.absoluteString
-            if let cached = cache.value(for: key) {
-                stats.memoryHits += 1
-                results.set(cached as Data, at: index)
+            // What is on the device is read here, before anything can queue
+            // behind the network. An offline package used to be read inside
+            // the fetch slot, so on a Wi-Fi that answered nothing the tiles it
+            // held waited out other tiles' fifteen-second timeouts and the
+            // downloaded area stayed white.
+            if let local = localBytes(url, key: key, stats: stats) {
+                results.set(local, at: index)
                 continue
             }
             lock.lock()
             if empties.value(for: key) == true {
                 lock.unlock()
+                results.set(nil, at: index)
                 continue
             }
             if let latch = inFlight[key] {
@@ -810,22 +917,28 @@ public final class VectorTileProvider: TileProvider {
             }
         }
 
+        // Everything below waits on the network, and no longer than this.
+        let deadline = DispatchTime.now() + sourceGrace
+        func expired() -> Bool { DispatchTime.now() >= deadline }
+
         while group.wait(timeout: .now() + .milliseconds(10)) != .success {
             if isClosed || isCancelled() {
                 cancellation.cancel()
                 stats.cancelled += 1
                 return nil
             }
+            if expired() { break }
         }
 
         // The ones somebody else was fetching ran alongside ours; waiting for
         // them now costs the slowest of them, not the sum, and holds nothing
         // but this thread.
-        for (index, key, originalLatch) in waitingOn {
+        waiting: for (index, key, originalLatch) in waitingOn {
             var latch = originalLatch
             while true {
                 while latch.wait(timeout: .now() + .milliseconds(10)) != .success {
                     if isClosed || isCancelled() { return nil }
+                    if expired() { continue waiting }
                 }
                 latch.signal()
                 // An oversized or evicted tile still belongs to all requests
@@ -848,6 +961,7 @@ public final class VectorTileProvider: TileProvider {
                 }
                 if latch.isUnavailable {
                     stats.blocked += 1
+                    results.set(nil, at: index)
                     break
                 }
                 // They were cancelled before the bytes landed, and a tile left
@@ -856,6 +970,7 @@ public final class VectorTileProvider: TileProvider {
                 lock.lock()
                 if empties.value(for: key) == true {
                     lock.unlock()
+                    results.set(nil, at: index)
                     break
                 }
                 let done = inFlight[key] ?? SourceFetchFlight()
@@ -876,6 +991,7 @@ public final class VectorTileProvider: TileProvider {
                     }
                     while retry.wait(timeout: .now() + .milliseconds(10)) != .success {
                         if isClosed || isCancelled() { return nil }
+                        if expired() { continue waiting }
                     }
                     break
                 }
@@ -884,7 +1000,49 @@ public final class VectorTileProvider: TileProvider {
                 latch = done
             }
         }
-        return results.snapshot()
+
+        // Whatever has not answered by now is drawn without. The tile is not
+        // kept, and its sources -- still coming -- bring the redraw.
+        let snapshot = results.snapshot()
+        let pending = urls.indices.compactMap { index -> String? in
+            guard let url = urls[index], !snapshot.settled[index] else { return nil }
+            return url.absoluteString
+        }
+        if !pending.isEmpty {
+            detached = true
+            stats.pending += pending.count
+            lock.lock()
+            drawnWithout.formUnion(pending)
+            lock.unlock()
+            // A source that landed between the deadline and the line above
+            // found nobody waiting for it; it is owed the handover all the same.
+            for key in pending where cache.value(for: key) != nil { sourceLanded(key) }
+        }
+        return snapshot.values
+    }
+
+    /**
+     A source tile already on the device: in memory, in the offline package,
+     or in the disk cache. Never waits for the network; a stale disk entry is
+     served as it is and checked in the background.
+     */
+    private func localBytes(_ url: URL, key: String, stats: SourceFetchStats) -> Data? {
+        if let cached = cache.value(for: key) {
+            stats.memoryHits += 1
+            return cached as Data
+        }
+        if let local = localTile?(url), !local.isEmpty {
+            stats.localHits += 1
+            cache.insert(local, for: key, cost: local.count + key.utf8.count + 128)
+            return local
+        }
+        if let entry = sourceDiskCache?.entry(key) {
+            stats.diskHits += 1
+            cache.insert(entry.bytes, for: key, cost: entry.bytes.count + key.utf8.count + 128)
+            if entry.meta?.isStale() ?? true { revalidate(url, key: key, cached: entry.bytes, meta: entry.meta) }
+            return entry.bytes
+        }
+        return nil
     }
 
     /// The transfer itself, and nothing else under a fetch slot.
@@ -912,45 +1070,133 @@ public final class VectorTileProvider: TileProvider {
         defer { fetchSlots.signal() }
         if cancellation.isCancelled || isClosed { return nil }
 
-        // Claim the URL before disk I/O so neighbouring tiles share cold reads.
+        // Somebody may have finished it while this one queued for a slot.
         if let cached = cache.value(for: key) {
             stats.memoryHits += 1
             done.publish(cached)
             return cached as Data
         }
-        if let cached = sourceDiskCache?.get(key) {
-            stats.diskHits += 1
-            cache.insert(cached, for: key, cost: cached.count + key.utf8.count + 128)
-            done.publish(cached)
-            return cached
-        }
         stats.networkFetches += 1
-        let fetched: Data?
+        let response: SourceResponse
         do {
-            fetched = try fetchTile(url, cancellation)
+            response = try sourceFetch(url, cancellation)
         } catch {
+            if cancellation.isCancelled { return nil }
             // Not an answer: the network is off, or failed. Either way the
             // tile is drawn without this source and not kept, so it is
             // drawn again once the network is back -- and the URL is not
             // remembered as empty.
             stats.blocked += 1
             done.markUnavailable()
+            lock.lock()
+            drawnWithout.remove(key)
+            lock.unlock()
             return nil
         }
-        guard let bytes = fetched, !bytes.isEmpty else {
+        guard let bytes = response.body, !bytes.isEmpty else {
             if cancellation.isCancelled { return nil }
             // Only a genuine "no tile" answer is remembered. A transient
             // failure blacklisted here would leave a hole for the session.
             lock.lock()
             empties.insert(true, for: key, cost: key.utf8.count + 128)
+            drawnWithout.remove(key)
             lock.unlock()
             done.publish(nil)
             return nil
         }
         cache.insert(bytes, for: key, cost: bytes.count + key.utf8.count + 128)
-        sourceDiskCache?.put(key, bytes)
+        sourceDiskCache?.put(key, bytes, meta: SourceTileDiskCache.Meta(
+            etag: response.validators.etag,
+            lastModified: response.validators.lastModified,
+            fetchedAt: Date().timeIntervalSince1970,
+            maxAge: response.maxAge
+        ))
         done.publish(bytes)
+        sourceLanded(key)
         return bytes
+    }
+
+    /// A source arrived. Worth a handover only if a tile was drawn without it.
+    private func sourceLanded(_ key: String) {
+        lock.lock()
+        let wanted = drawnWithout.remove(key) != nil
+        lock.unlock()
+        if wanted { sourcesArrived() }
+    }
+
+    /**
+     Checks a stale cached tile with the server, off every path a tile waits on.
+
+     The cached bytes have already been drawn; this only decides whether they
+     are still right. A 304 refreshes the sidecar, new bytes replace the old
+     ones and redraw the map, and any failure -- offline included -- leaves the
+     cache exactly as it was.
+     */
+    private func revalidate(_ url: URL, key: String, cached: Data, meta: SourceTileDiskCache.Meta?) {
+        guard let revalidator, let disk = sourceDiskCache else { return }
+        lock.lock()
+        let mine = !closed && revalidating.insert(key).inserted
+        lock.unlock()
+        guard mine else { return }
+        revalidationQueue.addOperation { [weak self] in
+            defer {
+                self?.lock.lock()
+                self?.revalidating.remove(key)
+                self?.lock.unlock()
+            }
+            guard let self, !self.isClosed,
+                  let response = try? revalidator(url, meta?.validators ?? .none)
+            else { return }
+            let now = Date().timeIntervalSince1970
+            if response.notModified {
+                disk.confirm(key, meta: SourceTileDiskCache.Meta(
+                    etag: response.validators.etag ?? meta?.etag,
+                    lastModified: response.validators.lastModified ?? meta?.lastModified,
+                    fetchedAt: now,
+                    maxAge: response.maxAge ?? meta?.maxAge
+                ))
+                return
+            }
+            guard (200..<300).contains(response.status), let bytes = response.body, !bytes.isEmpty else { return }
+            let fresh = SourceTileDiskCache.Meta(
+                etag: response.validators.etag,
+                lastModified: response.validators.lastModified,
+                fetchedAt: now,
+                maxAge: response.maxAge
+            )
+            // A server without validators answers 200 every time; the same
+            // bytes again are a confirmation, not a change.
+            guard bytes != cached else {
+                disk.confirm(key, meta: fresh)
+                return
+            }
+            disk.put(key, bytes, meta: fresh)
+            self.cache.insert(bytes, for: key, cost: bytes.count + key.utf8.count + 128)
+            self.lock.lock()
+            self.replacedSources = true
+            self.lock.unlock()
+            disk.bumpRevision()
+            self.sourcesArrived()
+        }
+    }
+
+    /// Coalesced like the glyph handover: a viewport's sources land together.
+    private func sourcesArrived() {
+        lock.lock()
+        if sourcesNotifyPending || closed {
+            lock.unlock()
+            return
+        }
+        sourcesNotifyPending = true
+        lock.unlock()
+        fetchQueue.asyncAfter(deadline: .now() + notifyQuiet) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            self.sourcesNotifyPending = false
+            let notify = self.closed ? nil : self.onSourcesLoaded
+            self.lock.unlock()
+            notify?()
+        }
     }
 
     // MARK: - Glyphs and sprites
@@ -1234,21 +1480,26 @@ final class FetchCancellation: @unchecked Sendable {
 private final class FetchResults: @unchecked Sendable {
     private let lock = NSLock()
     private var values: [Data?]
+    /// Answered, even if the answer was "nothing": what is not settled is
+    /// still on its way.
+    private var settled: [Bool]
 
     init(count: Int) {
         values = [Data?](repeating: nil, count: count)
+        settled = [Bool](repeating: false, count: count)
     }
 
     func set(_ value: Data?, at index: Int) {
         lock.lock()
         values[index] = value
+        settled[index] = true
         lock.unlock()
     }
 
-    func snapshot() -> [Data?] {
+    func snapshot() -> (values: [Data?], settled: [Bool]) {
         lock.lock()
         defer { lock.unlock() }
-        return values
+        return (values, settled)
     }
 }
 
