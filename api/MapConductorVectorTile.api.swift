@@ -170,7 +170,7 @@ final public class VectorTileProvider : MapConductorCore::TileProvider {
   }
   final public var onGlyphsLoaded: (() -> Swift::Void)?
   final public var onSourcesLoaded: (() -> Swift::Void)?
-  public static let sourceGrace: Swift::Double
+  public static let sourceDeadline: Swift::Double
   public enum RenderMode {
     case cpu
     case gpu
@@ -208,6 +208,8 @@ final public class VectorTileProvider : MapConductorCore::TileProvider {
   }
   final public func renderTile(request: MapConductorCore::TileRequest) -> Foundation::Data?
   final public func renderTile(request: MapConductorCore::TileRequest, isCancelled: () -> Swift::Bool) -> Foundation::Data?
+  final public func prepareTile(request: MapConductorCore::TileRequest, isCancelled: () -> Swift::Bool)
+  final public func prepareTile(request: MapConductorCore::TileRequest, content: MapConductorVectorTile::VectorTileProvider.MapConductorVectorTile::Content = .full, isCancelled: () -> Swift::Bool = { false })
   final public func renderTile(request: MapConductorCore::TileRequest, content: MapConductorVectorTile::VectorTileProvider.MapConductorVectorTile::Content = .full, isCancelled: () -> Swift::Bool = { false }) -> Foundation::Data?
 }
 final public class VectorTileRasteriser : MapConductorVectorStyle::VectorStyleRasteriser {

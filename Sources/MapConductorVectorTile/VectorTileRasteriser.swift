@@ -230,9 +230,10 @@ public final class VectorTileRasteriser: VectorStyleRasteriser {
             }
         }
 
-        /// Glyphs arrive after the tiles that need them -- a range is a round
-        /// trip and a low zoom wants dozens -- so tiles are drawn with what
-        /// is loaded and the labels refetched once more is.
+        /// Tiles wait for their glyph ranges and are drawn once, with them.
+        /// This handover is for the exception: a tile that gave up waiting
+        /// (a stalled connection, or offline) and whose ranges landed later.
+        /// Only then are the labels refetched.
         private func watchGlyphs(of created: VectorTileProvider) {
             created.onGlyphsLoaded = { [weak self, weak created] in
                 guard let self else { return }
@@ -251,9 +252,11 @@ public final class VectorTileRasteriser: VectorStyleRasteriser {
             }
         }
 
-        /// Tiles drawn before slow sources arrived are missing geometry as
-        /// well as labels, so both halves are refetched -- unlike glyphs,
-        /// which only ever change the overlay.
+        /// Tiles wait for their sources and are drawn once, complete. A tile
+        /// that gave up at the deadline is missing geometry as well as labels,
+        /// so when its sources land both halves are refetched -- unlike
+        /// glyphs, which only ever change the overlay. A revalidation that
+        /// finds new bytes upstream lands here too; both are rare.
         private func watchSources(of created: VectorTileProvider) {
             created.onSourcesLoaded = { [weak self, weak created] in
                 guard let self else { return }

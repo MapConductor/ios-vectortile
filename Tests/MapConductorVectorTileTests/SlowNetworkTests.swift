@@ -121,8 +121,56 @@ final class SlowNetworkTests: XCTestCase {
         XCTAssertGreaterThan(fetcher.stats.packageHits, 0)
     }
 
-    // (b)
-    func testTileDrawnShortIsNotKeptAndItsSourceBringsTheRedraw() throws {
+    // MARK: - One load per tile
+
+    /**
+     A source a little slow to arrive is waited for: the tile is drawn once,
+     complete, and kept. It used to be drawn without it after 0.4 s and the
+     whole layer reloaded when it landed -- the second load after every zoom.
+     */
+    func testSlowSourceIsWaitedForAndTheTileIsDrawnOnce() throws {
+        let expected = try reference()
+        let assets = directory()
+        let lock = NSLock()
+        var fetches = 0
+        let provider = try VectorTileProvider(
+            styleJSON: styleJSON, tileSize: 256, renderMode: .cpu,
+            assetCacheDirectory: assets, renderScale: 1
+        ) { [tileData] _ in
+            lock.lock(); fetches += 1; lock.unlock()
+            Thread.sleep(forTimeInterval: 1.0)
+            return tileData
+        }
+        cleanups.append { provider.close() }
+        provider.onSourcesLoaded = { XCTFail("a tile drawn whole needs no redraw") }
+
+        XCTAssertEqual(
+            provider.renderTile(request: TileRequest(x: 0, y: 0, z: 0), content: .ground), expected,
+            "the tile was drawn before its source arrived"
+        )
+        // Long enough for a handover to have been sent, had there been one.
+        RunLoop.current.run(until: Date().addingTimeInterval(1.0))
+        XCTAssertEqual(fetches, 1)
+
+        // Kept: the next provider on the same cache is served the drawn tile
+        // without fetching anything.
+        let next = try VectorTileProvider(
+            styleJSON: styleJSON, tileSize: 256, renderMode: .cpu,
+            assetCacheDirectory: assets, renderScale: 1
+        ) { url in
+            XCTFail("a kept tile fetched its source again: \(url)")
+            return nil
+        }
+        cleanups.append { next.close() }
+        XCTAssertEqual(next.renderTile(request: TileRequest(x: 0, y: 0, z: 0), content: .ground), expected)
+    }
+
+    /**
+     Past ``VectorTileProvider/sourceDeadline`` a tile stops waiting: it is
+     drawn with what it has, not kept, and the source -- still coming --
+     brings the redraw. The one case a layer is reloaded.
+     */
+    func testTileDrawnShortAtTheDeadlineIsNotKeptAndItsSourceBringsTheRedraw() throws {
         let expected = try reference()
         let gate = DispatchSemaphore(value: 0)
         cleanups.append { gate.signal() }
@@ -136,13 +184,14 @@ final class SlowNetworkTests: XCTestCase {
             _ = gate.wait(timeout: .now() + 10)
             return tileData
         }
+        provider.sourceDeadline = 0.5
         cleanups.append { provider.close() }
         let loaded = expectation(description: "onSourcesLoaded")
         provider.onSourcesLoaded = { loaded.fulfill() }
 
         let started = Date()
         let short = provider.renderTile(request: TileRequest(x: 0, y: 0, z: 0), content: .ground)
-        XCTAssertLessThan(Date().timeIntervalSince(started), VectorTileProvider.sourceGrace + 1)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.5 + 1)
         XCTAssertNotNil(short, "a tile is drawn with what it has")
         XCTAssertNotEqual(short, expected)
 
@@ -151,6 +200,69 @@ final class SlowNetworkTests: XCTestCase {
         let finished = provider.renderTile(request: TileRequest(x: 0, y: 0, z: 0), content: .ground)
         XCTAssertEqual(finished, expected, "the short tile was kept and served again")
         XCTAssertEqual(fetches, 1, "the fetch kept running after the tile was drawn without it")
+    }
+
+    /**
+     The wait belongs to ``VectorTileProvider/prepareTile(request:content:isCancelled:)``,
+     which the tile server runs outside its render lane. The render that
+     follows takes what came and does not wait again -- otherwise a slow tile
+     would hold a lane slot for the whole wait a second time.
+     */
+    func testRenderAfterPrepareDoesNotWaitAgain() throws {
+        let gate = DispatchSemaphore(value: 0)
+        cleanups.append { for _ in 0..<4 { gate.signal() } }
+        let provider = try VectorTileProvider(
+            styleJSON: styleJSON, tileSize: 256, renderMode: .cpu, renderScale: 1
+        ) { [tileData] _ in
+            _ = gate.wait(timeout: .now() + 10)
+            return tileData
+        }
+        provider.sourceDeadline = 0.5
+        cleanups.append { provider.close() }
+        let request = TileRequest(x: 0, y: 0, z: 0)
+
+        let preparing = Date()
+        provider.groundTiles.prepareTile(request: request) { false }
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(preparing), 0.45, "prepare did not wait")
+
+        let rendering = Date()
+        XCTAssertNotNil(provider.groundTiles.renderTile(request: request))
+        XCTAssertLessThan(Date().timeIntervalSince(rendering), 0.3, "the render waited for the network again")
+    }
+
+    /**
+     Labels wait for the glyph ranges they use, so the first answer has them.
+     Before, the tile was drawn bare and `onGlyphsLoaded` reloaded the whole
+     label layer once the range landed.
+     */
+    func testLabelsWaitForTheirGlyphsAndAreDrawnOnce() throws {
+        let glyphs = try Data(contentsOf: try XCTUnwrap(Bundle.module.url(forResource: "glyphs-0-255", withExtension: "pbf")))
+        // Not z0: the demo style's symbol layers start at z1 and z2.
+        let target = TileRequest(x: 1, y: 1, z: 2)
+        func labels(glyphDelay: TimeInterval?) throws -> (png: Data?, handovers: Int) {
+            let lock = NSLock()
+            var handovers = 0
+            let provider = try VectorTileProvider(
+                styleJSON: styleJSON, tileSize: 256, renderMode: .cpu, renderScale: 1
+            ) { [tileData] url in
+                guard url.path.contains("/font/") else { return tileData }
+                guard let glyphDelay else { return nil }
+                Thread.sleep(forTimeInterval: glyphDelay)
+                return glyphs
+            }
+            defer { provider.close() }
+            provider.onGlyphsLoaded = { lock.lock(); handovers += 1; lock.unlock() }
+            let png = provider.labelTiles.renderTile(request: target)
+            RunLoop.current.run(until: Date().addingTimeInterval(1.5))
+            lock.lock(); defer { lock.unlock() }
+            return (png, handovers)
+        }
+
+        let bare = try labels(glyphDelay: nil)
+        let slow = try labels(glyphDelay: 0.3)
+        XCTAssertNotNil(slow.png)
+        XCTAssertNotEqual(slow.png, bare.png, "the labels were drawn before their glyphs arrived")
+        XCTAssertEqual(slow.handovers, 0, "a tile drawn with its labels needs no handover")
     }
 
     /// One empty layer: a valid tile that draws only the background.

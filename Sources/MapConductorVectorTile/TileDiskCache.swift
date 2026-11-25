@@ -33,6 +33,11 @@ final class TileDiskCache {
         directory.appendingPathComponent("\(key).png")
     }
 
+    /// Whether a tile is stored, without reading it.
+    func contains(_ key: String) -> Bool {
+        queue.sync { FileManager.default.fileExists(atPath: file(key).path) }
+    }
+
     func get(_ key: String) -> Data? {
         queue.sync {
             let path = file(key)

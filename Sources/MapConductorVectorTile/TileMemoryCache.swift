@@ -87,6 +87,11 @@ final class TileMemoryCache<Value> {
         bytes -= entry.cost
     }
 
+    func remove(_ key: String) {
+        lock.lock(); defer { lock.unlock() }
+        if let entry = entries[key] { remove(entry) }
+    }
+
     func removeAll() {
         lock.lock(); defer { lock.unlock() }
         // Break the chain iteratively rather than recursing through deinit.
