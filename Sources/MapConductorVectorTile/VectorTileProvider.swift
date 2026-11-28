@@ -1293,7 +1293,16 @@ public final class VectorTileProvider: TileProvider {
         }
     }
 
-    /// Coalesced like the glyph handover: a viewport's sources land together.
+    /**
+     Coalesced like the glyph handover, for the same reason: sources land in
+     bursts, and a refetch per arrival would redraw the screen over and over
+     to reach one picture. The window is held while sources drawn-short tiles
+     are waiting on, or revalidations, are still in flight, up to
+     ``notifyMaxWait``. Revalidations come in bursts too: a cache left for
+     weeks is asked about tile by tile when the map opens, and upstream data
+     that changed meanwhile would otherwise hand the layer over once per
+     answer.
+     */
     private func sourcesArrived() {
         lock.lock()
         if sourcesNotifyPending || closed {
@@ -1302,14 +1311,29 @@ public final class VectorTileProvider: TileProvider {
         }
         sourcesNotifyPending = true
         lock.unlock()
+        scheduleSourcesNotify(deadline: Date().addingTimeInterval(notifyMaxWait))
+    }
+
+    private func scheduleSourcesNotify(deadline: Date) {
         fetchQueue.asyncAfter(deadline: .now() + notifyQuiet) { [weak self] in
             guard let self else { return }
+            if self.sourcesStillComing(), Date() < deadline, !self.isClosed {
+                self.scheduleSourcesNotify(deadline: deadline)
+                return
+            }
             self.lock.lock()
             self.sourcesNotifyPending = false
             let notify = self.closed ? nil : self.onSourcesLoaded
             self.lock.unlock()
             notify?()
         }
+    }
+
+    /// Fetches a drawn-short tile is waiting on, or revalidations, still going.
+    private func sourcesStillComing() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !revalidating.isEmpty || drawnWithout.contains { inFlight[$0] != nil }
     }
 
     // MARK: - Glyphs and sprites
