@@ -80,7 +80,7 @@ final class RasterisationTests: XCTestCase {
         drainPendingUpdates()
         XCTAssertEqual(host.mounted.count, 3, "a burst should publish only one ground update")
         XCTAssertEqual(try pixel(in: host.mounted[2]), [0, 0, 40, 255], "the final requested colour must reach the map")
-        XCTAssertEqual(host.mounted.filter { $0.id.hasSuffix("-labels") }.map(\.source), [labels])
+        XCTAssertEqual(host.mounted.filter { $0.id.contains("-labels-") }.map(\.source), [labels])
 
         // The compiler reports .none for returning to the authored style.
         // It is still a change relative to the pixels currently on screen.
@@ -90,8 +90,24 @@ final class RasterisationTests: XCTestCase {
         XCTAssertEqual(try pixel(in: host.mounted[3]), [0, 0, 0, 255])
         work.restyle(styleJSON: document("#000000", visible: true), affects: .labels)
         settle { host.mounted.count == 5 }
-        XCTAssertTrue(host.mounted[4].id.hasSuffix("-labels"))
+        XCTAssertTrue(host.mounted[4].id.contains("-labels-"))
         XCTAssertTrue(host.mounted[4].visible)
+    }
+
+    /// Replacing a half in place is remove-then-add on the map, which leaves
+    /// it bare (or magnifies a low-zoom tile) until the new source draws.
+    func testRestyleMountsTheNewGroundBeforeRemovingTheOld() {
+        let host = Host()
+        let work = VectorTileRasteriser(tileSize: 32, renderMode: .cpu, renderScale: 1)
+            .install(host: host, styleJSON: document("#000000"), affects: .both)
+        defer { work.dispose() }
+        settle { host.mounted.count == 2 }
+        let oldGround = host.mounted[0].id
+        work.restyle(styleJSON: document("#ffffff"), affects: .ground)
+        settle { host.mounted.count == 3 }
+        XCTAssertNotEqual(host.mounted[2].id, oldGround, "the replacement goes up under its own id")
+        XCTAssertTrue(host.removed.isEmpty, "the old ground stays until the new one has had time to draw")
+        settle { host.removed == [oldGround] }
     }
 
     func testDisposalPreventsPendingRestyleFromRemountingLayers() {

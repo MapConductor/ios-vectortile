@@ -95,6 +95,20 @@ public final class VectorTileRasteriser: VectorStyleRasteriser {
         private var groundGeneration = 0
         private var labelGeneration = 0
 
+        /**
+         The layers currently mounted for each half: normally one, briefly
+         two. Touched on the main thread only.
+
+         Changing a raster layer's source is remove-then-add on the map, so
+         the half would vanish -- and the map show the deepest tile it still
+         has, magnified -- for as long as the new source takes its first
+         tiles. The replacement goes up alongside under its own id and the
+         old one comes down a moment later, as in android-vectortile's
+         `VectorTileLayer`.
+         */
+        private var mountedGround: [String] = []
+        private var mountedLabels: [String] = []
+
         init(host: MapStyleHost, options: VectorTileRasteriser) {
             self.host = host
             self.options = options
@@ -174,9 +188,22 @@ public final class VectorTileRasteriser: VectorStyleRasteriser {
             host.tileServer.unregister(routeId: "\(groupId)-geom")
             host.tileServer.unregister(routeId: "\(groupId)-labels")
             current?.closeAsync()
-            DispatchQueue.main.async { [host, groupId] in
-                host.removeRaster(id: "\(groupId)-geom")
-                host.removeRaster(id: "\(groupId)-labels")
+            DispatchQueue.main.async { [self] in
+                (mountedGround + mountedLabels).forEach { host.removeRaster(id: $0) }
+                mountedGround.removeAll()
+                mountedLabels.removeAll()
+            }
+        }
+
+        private func handOver(_ state: RasterLayerState, mounted: ReferenceWritableKeyPath<Rasterisation, [String]>) {
+            guard self[keyPath: mounted].last != state.id else { return }
+            host.upsertRaster(state)
+            self[keyPath: mounted].append(state.id)
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.handover) { [weak self] in
+                guard let self, !isDisposed() else { return }
+                while self[keyPath: mounted].count > 1 {
+                    host.removeRaster(id: self[keyPath: mounted].removeFirst())
+                }
             }
         }
 
@@ -225,8 +252,8 @@ public final class VectorTileRasteriser: VectorStyleRasteriser {
             DispatchQueue.main.async { [weak self] in
                 guard let self, !isDisposed() else { return }
                 host.report(created.diagnostics())
-                if let ground { host.upsertRaster(ground) }
-                if let labels { host.upsertRaster(labels) }
+                if let ground { handOver(ground, mounted: \.mountedGround) }
+                if let labels { handOver(labels, mounted: \.mountedLabels) }
             }
         }
 
@@ -246,7 +273,7 @@ public final class VectorTileRasteriser: VectorStyleRasteriser {
                     lock.unlock()
                     DispatchQueue.main.async { [weak self] in
                         guard let self, !isDisposed() else { return }
-                        host.upsertRaster(labels)
+                        handOver(labels, mounted: \.mountedLabels)
                     }
                 }
             }
@@ -271,8 +298,8 @@ public final class VectorTileRasteriser: VectorStyleRasteriser {
                     lock.unlock()
                     DispatchQueue.main.async { [weak self] in
                         guard let self, !isDisposed() else { return }
-                        host.upsertRaster(ground)
-                        host.upsertRaster(labels)
+                        handOver(ground, mounted: \.mountedGround)
+                        handOver(labels, mounted: \.mountedLabels)
                     }
                 }
             }
@@ -298,9 +325,10 @@ public final class VectorTileRasteriser: VectorStyleRasteriser {
                     attributionRules: credits
                 ),
                 // Under everything the app declared, and under the
-                // labels. A style *is* the basemap here.
+                // labels. A style *is* the basemap here. Every generation
+                // at the same level: both draw the same map.
                 zIndex: -2,
-                id: "\(groupId)-geom"
+                id: "\(groupId)-geom-g\(groundGeneration)"
             )
         }
 
@@ -321,7 +349,7 @@ public final class VectorTileRasteriser: VectorStyleRasteriser {
                 ),
                 visible: displayedStyle?.hasVisibleSymbols ?? true,
                 zIndex: -1,
-                id: "\(groupId)-labels"
+                id: "\(groupId)-labels-g\(labelGeneration)"
             )
         }
 
@@ -331,5 +359,8 @@ public final class VectorTileRasteriser: VectorStyleRasteriser {
         }
 
         private static let maxZoom = 22
+
+        /// How long a replaced half stays up. Matches `HANDOVER_MS` in android-vectortile.
+        private static let handover: DispatchTimeInterval = .milliseconds(900)
     }
 }
